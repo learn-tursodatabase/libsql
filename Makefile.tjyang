@@ -1,0 +1,186 @@
+# Makefile front-end for rust dev works.
+VERSION		= 1.0
+RELEASE		= 2
+DATE		= $(shell date)
+NEWRELEASE	= $(shell echo $$(($(RELEASE) + 1)))
+PROJECT_NAME    = libsql
+TOPDIR = $(shell pwd)
+MANPAGES =
+A2PS2S1C  = /usr/bin/enscript -H1 --highlight-bar-gray=08 -fCourier8 -Ebash  --non-printable-format=space
+A2PSTMP   = ./tmp
+DOCS      = ./docs
+
+SHELL := /bin/bash
+
+.PHONY: all commit tests examples pdf doc docs sqld cmkrest cmd-demo cmk-agent-ctl cmkc
+
+all: help
+#https://stackoverflow.com/questions/6273608/how-to-pass-argument-to-makefile-from-command-line
+args = `arg="$(filter-out $@,$(MAKECMDGOALS))" && echo $${arg:-${1}}`
+%:
+	@:
+
+versionfile:
+	echo "version:" $(VERSION) > etc/version
+	echo "release:" $(RELEASE) >> etc/version
+	echo "source build date:" $(DATE) >> etc/version
+
+manpage:
+	for manpage in $(MANPAGES); do (pod2man --center=$$manpage --release="" ./docs/$$manpage.pod > ./docs/$$manpage.1); done
+
+clean: cleantmp
+	-rm -rf *~ 
+	-rm -rf docs/*.1
+	-find . -type f -name *~   -exec rm -f {} \;
+	-find . -type f -name *.ps  -exec rm -f {} \;
+	-find . -type d -name target  -exec rm -rf {} \;
+
+clean_hard:
+	-rm -rf $(shell $(PYTHON) -c "from distutils.sysconfig import get_python_lib; print get_python_lib()")/adagios 
+
+clean_hardest: clean_rpms
+
+
+#Ref: https://stackoverflow.com/questions/1490949/how-to-write-loop-in-a-makefile
+# MANIFEST  
+SRC1= README.md Makefile Cargo.toml libsql-dir-layout.txt docker-compose.yml run-integration-tests.sh
+SRC2= src/classes.rs src/functions.rs src/get-all-hosts.rs src/hello.rs src/main.rs src/tests/builder.rs src/tests/integration.rs src/tests/mod.rs
+SRC3= src/libsql_tests.rs
+#SRC2= manage.py profiles_projects-dir-layout.txt
+
+tmpdir:
+	mkdir -p ${A2PSTMP}/src/bin ${A2PSTMP}/src/controllers ${A2PSTMP}/src/views ${A2PSTMP}/tests/requests/snapshots
+cleantmp:
+	rm -f ${A2PSTMP}/*.ps ${A2PSTMP}/*.pdf	
+.ps: cleantmp
+	$(foreach var, $(SRC1), ${A2PS2S1C}  --output=${A2PSTMP}/$(var).ps $(var) ;)
+	$(foreach var, $(SRC2), ${A2PS2S1C}  --output=${A2PSTMP}/$(var).ps $(var) ;)
+	$(foreach var, $(SRC3), ${A2PS2S1C}  --output=${A2PSTMP}/$(var).ps $(var) ;)
+	touch .ps
+
+allpdf: .pdf
+	touch .pdf
+	rm -f ${A2PSTMP}/*.pdf
+	find  docs  -type f -name *.pdf -exec cp {}  ${A2PSTMP}/  \;
+	rm -f /mnt/hgfs/vmware/*.pdf
+	cp -f ${A2PSTMP}/*.pdf  /mnt/hgfs/vmware/
+	ls -lrt  /mnt/hgfs/vmware/*.pdf
+
+
+pdf: .pdf
+	touch .pdf
+.pdf: .ps
+	$(foreach var, $(SRC1), (cd ${A2PSTMP};ps2pdf $(var).ps $(var).pdf);)
+	$(foreach var, $(SRC2), (cd ${A2PSTMP};ps2pdf $(var).ps $(var).pdf);)
+	$(foreach var, $(SRC3), (cd ${A2PSTMP};ps2pdf $(var).ps $(var).pdf);)
+	rm -f ${A2PSTMP}/*.ps
+	cp ${A2PSTMP}/*.pdf  ${DOCS}/
+	rsync -azpv ${A2PSTMP}/src/*    ${DOCS}/src
+	rsync -azpv ${A2PSTMP}/src/tests/*  ${DOCS}/src/tests
+	find ${DOCS}/src/ -type f -name "*.ps" -exec rm -f {} \;
+	find ${DOCS}/src/ -type f
+	find ${DOCS}/tests/ -type f -name "*.ps" -exec rm -f {} \;
+	find ${DOCS}/tests/ -type f 
+	touch .pdf
+tree: clean
+	tree -L 5 > ${PROJECT_NAME}-dir-layout.txt
+
+.PHONY: tests test2
+testslist:
+	cargo test -- --list
+tests:
+	cargo test  -- client::v6::tests::create_host_group_and_host   
+	cargo test  -- client::v6::tests::session_should_be_returned   
+
+
+# enable makefile to accept argument after command
+#https://stackoverflow.com/questions/6273608/how-to-pass-argument-to-makefile-from-command-line
+
+args = `arg="$(filter-out $@,$(MAKECMDGOALS))" && echo $${arg:-${1}}`
+%:
+	@:
+
+status:
+	git status && git branch
+commit:
+	git commit -am "$(call args, Automated commit message without details, Please read the git diff)"  && git push
+pull:
+	git pull
+
+#	cp -p ${HOME}/.cargo/bin/libsql ${HOME}/.cargo/bin/libsql.old
+#	rm  ${HOME}/.cargo/bin/libsql 
+install:
+	cargo install  --force --path .
+#	strip --strip-all ${HOME}/.cargo/bin/libsql
+	ls -lhrt ${HOME}/.cargo/bin | tail -3
+
+cpsalt: install 
+	 cp ${HOME}/.cargo/bin/libsql /srv/salt/lgit/prod/zabbix/files/libsql/libsql.el8
+cpsalt01: install 
+	 scp -p ${HOME}/.cargo/bin/libsql tjyang@salt01.mot.com:/srv/salt/lgit/prod/zabbix/files/libsql/libsql.el9
+
+clip:
+	cargo clippy
+build:
+	cargo build && 	find target/debug  -maxdepth 1 -type f -perm /755 | egrep -v "\.d"
+	ls -lrt ${HOME}/.cargo/bin | tail -3
+format:
+	cargo fmt -v
+
+examples:
+	cargo build --examples && ls -lrt target/debug/examples/ |egrep -v "\.d"
+doc:
+	rustdoc README.md --crate-name docs
+	cargo doc
+	ls target/doc doc
+sqld:
+	rm -f ${HOME}/.cargo/bin/sqld
+	(cargo install --path . -f )
+	ls -lrt ${HOME}/.cargo/bin | tail -3
+
+dockerup:
+	 docker-compose up -d
+dockerdown:
+	 docker-compose down
+docker:
+	docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' | egrep 'zabbix|NAMES'
+
+test: 
+	cargo test --bin libsql -- --test-threads 1 --nocapture + 01 02 03 04 05 06 07 08 09 10 11 12 13 14
+cartest:
+	ncat -zv localhost 3080
+	cargo test
+
+itest:
+	ncat -zv localhost 3080
+	./run-integration-tests.sh
+
+delbranch: status
+	git branch -D "$(call args, remoteBranchName)" && git push origin --delete "$(call args, remoteBranchName)"
+
+check:
+	libsql check https://va32lnagios03t.mot.com/zabbix/api_jsonrpc.php
+	libsql check https://ilclnagios03.mot.com/zabbix/api_jsonrpc.php
+
+create:
+	libsql create "test02.test.com"
+
+help:
+	@echo "Usage: make <target> <argument>"
+	@echo
+	@echo "Available targets are:"
+	@echo "  sqld                   Generate sqld"
+	@echo "  pdf                    Generate selected files in pdf and copy into ./docs"
+	@echo "  allpdf                 Generate selected files in pdf and copy into vmware hgfs"
+	@echo "  tests                  build and test run"
+	@echo "  format                 run cargo fmt to format the rust code"
+	@echo "  build                  call up cargo build"
+	@echo "  examples               build all test programs in examples dir"
+	@echo "  install                install the binary in --path ."
+	@echo "  help                   Showing this help "
+	@echo "  clean                  clean all artifact files"
+	@echo "  commit {"my message"}  ie, git commit and push with defalut message"
+	@echo "  status                 ie, git status"
+	@echo "  pull                   ie, git pull"
+	@echo ""
+
