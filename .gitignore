@@ -13,3 +13,4 @@ libsql-sqlite3/**.o.tmp
 /bindings/c/generated
 /bindings/c/**.xcframework
 /bindings/**/.DS_Store
+*~
