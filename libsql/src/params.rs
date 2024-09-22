@@ -1,3 +1,5 @@
+//! This module contains all `Param` related utilities and traits.
+
 use crate::{Error, Result, Value};
 
 mod sealed {
@@ -6,7 +8,7 @@ mod sealed {
 
 use sealed::Sealed;
 
-/// Converts some type into paramters that can be passed
+/// Converts some type into parameters that can be passed
 /// to libsql.
 ///
 /// The trait is sealed and not designed to be implemented by hand
@@ -91,7 +93,7 @@ pub trait IntoParams: Sealed {
     fn into_params(self) -> Result<Params>;
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[doc(hidden)]
 pub enum Params {
     None,
@@ -303,6 +305,7 @@ impl From<Params> for libsql_replication::rpc::proxy::query::Params {
     }
 }
 
+/// Construct positional params from a hetergeneous set of params types.
 #[macro_export]
 macro_rules! params {
     () => {
@@ -315,6 +318,7 @@ macro_rules! params {
     }};
 }
 
+/// Construct named params from a hetergeneous set of params types.
 #[macro_export]
 macro_rules! named_params {
     () => {
@@ -324,4 +328,17 @@ macro_rules! named_params {
         use $crate::params::IntoValue;
         [$(($param_name, $value.into_value())),*]
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Value;
+
+    #[test]
+    fn test_serialize_array() {
+        assert_eq!(
+            params!([0; 16])[0].as_ref().unwrap(),
+            &Value::Blob(vec![0; 16])
+        );
+    }
 }

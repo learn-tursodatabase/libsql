@@ -2,7 +2,11 @@ use std::{path::PathBuf, process::Command};
 
 #[test]
 fn bootstrap() {
-    let iface_files = &["proto/replication_log.proto", "proto/proxy.proto"];
+    let iface_files = &[
+        "proto/metadata.proto",
+        "proto/replication_log.proto",
+        "proto/proxy.proto",
+    ];
     let dirs = &["proto"];
 
     let out_dir = PathBuf::from(std::env!("CARGO_MANIFEST_DIR"))
@@ -15,7 +19,7 @@ fn bootstrap() {
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        .build_transport(true)
+        .build_transport(false)
         .out_dir(&out_dir)
         .type_attribute(".proxy", "#[derive(serde::Serialize, serde::Deserialize)]")
         .compile_with_config(config, iface_files, dirs)

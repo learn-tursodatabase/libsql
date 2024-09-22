@@ -197,6 +197,24 @@ int sqlite3LookasideUsed(sqlite3 *db, int *pHighwater){
 }
 
 /*
+** Hacky, and will be gone once we move WAL encryption layer
+** entirely to virtual WAL.
+** Assumes the BTree locks are already held.
+*/
+#ifdef LIBSQL_CUSTOM_PAGER_CODEC
+void *libsql_leak_pager(sqlite3 *db) {
+  int i;
+  for(i=0; i<db->nDb; i++){
+    Btree *pBt = db->aDb[i].pBt;
+    if( pBt ){
+      return sqlite3BtreePager(pBt);
+    }
+  }
+  return NULL;
+}
+#endif
+
+/*
 ** Query status information for a single database connection
 */
 int sqlite3_db_status(
@@ -362,7 +380,7 @@ int sqlite3_db_status(
     case SQLITE_DBSTATUS_CACHE_MISS:
     case SQLITE_DBSTATUS_CACHE_WRITE:{
       int i;
-      int nRet = 0;
+      u64 nRet = 0;
       assert( SQLITE_DBSTATUS_CACHE_MISS==SQLITE_DBSTATUS_CACHE_HIT+1 );
       assert( SQLITE_DBSTATUS_CACHE_WRITE==SQLITE_DBSTATUS_CACHE_HIT+2 );
 
@@ -375,7 +393,7 @@ int sqlite3_db_status(
       *pHighwater = 0; /* IMP: R-42420-56072 */
                        /* IMP: R-54100-20147 */
                        /* IMP: R-29431-39229 */
-      *pCurrent = nRet;
+      *pCurrent = (int)nRet & 0x7fffffff;
       break;
     }
 

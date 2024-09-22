@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use crate::{Error, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Value {
     Null,
@@ -12,7 +12,8 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
-#[derive(Debug)]
+/// The possible types a column can be in libsql.
+#[derive(Debug, Copy, Clone)]
 pub enum ValueType {
     Integer = 1,
     Real,
@@ -110,6 +111,18 @@ impl Value {
     }
 }
 
+impl From<i8> for Value {
+    fn from(value: i8) -> Value {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<i16> for Value {
+    fn from(value: i16) -> Value {
+        Value::Integer(value as i64)
+    }
+}
+
 impl From<i32> for Value {
     fn from(value: i32) -> Value {
         Value::Integer(value as i64)
@@ -119,6 +132,18 @@ impl From<i32> for Value {
 impl From<i64> for Value {
     fn from(value: i64) -> Value {
         Value::Integer(value)
+    }
+}
+
+impl From<u8> for Value {
+    fn from(value: u8) -> Value {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<u16> for Value {
+    fn from(value: u16) -> Value {
+        Value::Integer(value as i64)
     }
 }
 
@@ -219,17 +244,18 @@ impl From<libsql_sys::Value> for Value {
                 assert!(len >= 0, "unexpected negative bytes value from sqlite3");
 
                 let mut v = Vec::with_capacity(len as usize);
-
-                let slice: &[u8] =
-                    unsafe { std::slice::from_raw_parts(blob as *const u8, len as usize) };
-                v.extend_from_slice(slice);
+                if !blob.is_null() {
+                    let slice: &[u8] =
+                        unsafe { std::slice::from_raw_parts(blob as *const u8, len as usize) };
+                    v.extend_from_slice(slice);
+                }
                 Value::Blob(v)
             }
         }
     }
 }
 
-// Heavily inspired by rusqlite's ValueRef
+/// A borrowed version of `Value`.
 #[derive(Debug)]
 pub enum ValueRef<'a> {
     Null,
@@ -419,11 +445,28 @@ impl From<libsql_sys::ValueType> for ValueType {
 }
 
 #[cfg(feature = "replication")]
-impl TryFrom<libsql_replication::rpc::proxy::Value> for Value {
+impl TryFrom<&libsql_replication::rpc::proxy::Value> for Value {
     type Error = Error;
 
-    fn try_from(value: libsql_replication::rpc::proxy::Value) -> Result<Self> {
-        bincode::deserialize(&value.data[..]).map_err(Error::from)
+    fn try_from(value: &libsql_replication::rpc::proxy::Value) -> Result<Self> {
+        #[derive(serde::Deserialize)]
+        pub enum BincodeValue {
+            Null,
+            Integer(i64),
+            Real(f64),
+            Text(String),
+            Blob(Vec<u8>),
+        }
+
+        Ok(
+            match bincode::deserialize::<'_, BincodeValue>(&value.data[..]).map_err(Error::from)? {
+                BincodeValue::Null => Value::Null,
+                BincodeValue::Integer(i) => Value::Integer(i),
+                BincodeValue::Real(x) => Value::Real(x),
+                BincodeValue::Text(s) => Value::Text(s),
+                BincodeValue::Blob(b) => Value::Blob(b),
+            },
+        )
     }
 }
 
@@ -432,7 +475,7 @@ mod serde_ {
     use std::marker::PhantomData;
 
     use serde::de::value::SeqDeserializer;
-    use serde::de::{self, IntoDeserializer, Visitor};
+    use serde::de::{self, EnumAccess, IntoDeserializer, VariantAccess, Visitor};
     use serde::Deserialize;
     use serde::Deserializer;
 
@@ -444,7 +487,7 @@ mod serde_ {
             D: serde::Deserializer<'de>,
         {
             struct V;
-            impl Visitor<'_> for V {
+            impl<'de> Visitor<'de> for V {
                 type Value = Value;
 
                 fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -458,11 +501,74 @@ mod serde_ {
                     Ok(Value::Integer(v))
                 }
 
+                fn visit_i32<E>(self, v: i32) -> std::result::Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(Value::Integer(v as i64))
+                }
+
+                fn visit_i16<E>(self, v: i16) -> std::result::Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(Value::Integer(v as i64))
+                }
+
+                fn visit_i8<E>(self, v: i8) -> std::result::Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(Value::Integer(v as i64))
+                }
+
+                fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    if v > i64::MAX as u64 {
+                        Err(serde::de::Error::invalid_value(
+                            de::Unexpected::Unsigned(v),
+                            &"u64 is too large to fit in an i64",
+                        ))
+                    } else {
+                        Ok(Value::Integer(v as i64))
+                    }
+                }
+
+                fn visit_u32<E>(self, v: u32) -> std::result::Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(Value::Integer(v as i64))
+                }
+
+                fn visit_u16<E>(self, v: u16) -> std::result::Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(Value::Integer(v as i64))
+                }
+
+                fn visit_u8<E>(self, v: u8) -> std::result::Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(Value::Integer(v as i64))
+                }
+
                 fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E>
                 where
                     E: serde::de::Error,
                 {
                     Ok(Value::Real(v))
+                }
+
+                fn visit_f32<E>(self, v: f32) -> std::result::Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(Value::Real(v as f64))
                 }
 
                 fn visit_byte_buf<E>(self, v: Vec<u8>) -> std::result::Result<Self::Value, E>
@@ -479,11 +585,35 @@ mod serde_ {
                     Ok(Value::Text(v))
                 }
 
+                fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    Ok(Value::Text(v.to_string()))
+                }
+
+                fn visit_some<D>(
+                    self,
+                    deserializer: D,
+                ) -> std::result::Result<Self::Value, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    Deserialize::deserialize(deserializer)
+                }
+
                 fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
                 where
                     E: serde::de::Error,
                 {
                     Ok(Value::Null)
+                }
+
+                fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    Ok(Value::Integer(v as i64))
                 }
             }
 
@@ -500,9 +630,9 @@ mod serde_ {
         type Error = E;
 
         serde::forward_to_deserialize_any! {
-            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
                 bytes byte_buf unit_struct newtype_struct seq tuple tuple_struct
-                map struct enum identifier ignored_any
+                map struct identifier ignored_any
         }
 
         fn deserialize_unit<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
@@ -525,6 +655,20 @@ mod serde_ {
             }
         }
 
+        fn deserialize_bool<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self.value {
+                Value::Integer(0) => visitor.visit_bool(false),
+                Value::Integer(1) => visitor.visit_bool(true),
+                _ => Err(de::Error::invalid_value(
+                    de::Unexpected::Other(&format!("{:?}", self.value)),
+                    &"a valid sqlite boolean representation (0 or 1)",
+                )),
+            }
+        }
+
         fn deserialize_any<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
         where
             V: Visitor<'de>,
@@ -535,6 +679,85 @@ mod serde_ {
                 Value::Real(x) => visitor.visit_f64(x),
                 Value::Text(s) => visitor.visit_string(s),
                 Value::Blob(b) => visitor.visit_seq(SeqDeserializer::new(b.into_iter())),
+            }
+        }
+
+        fn deserialize_enum<V>(
+            self,
+            _name: &'static str,
+            _variants: &'static [&'static str],
+            visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            struct ValueEnumAccess(String);
+            impl<'de> EnumAccess<'de> for ValueEnumAccess {
+                type Error = de::value::Error;
+                type Variant = ValueVariantAccess;
+
+                fn variant_seed<V>(
+                    self,
+                    seed: V,
+                ) -> std::result::Result<(V::Value, Self::Variant), Self::Error>
+                where
+                    V: de::DeserializeSeed<'de>,
+                {
+                    seed.deserialize(self.0.into_deserializer())
+                        .map(|v| (v, ValueVariantAccess))
+                }
+            }
+
+            struct ValueVariantAccess;
+            impl<'de> VariantAccess<'de> for ValueVariantAccess {
+                type Error = de::value::Error;
+
+                fn unit_variant(self) -> std::result::Result<(), Self::Error> {
+                    Ok(())
+                }
+
+                fn newtype_variant_seed<T>(
+                    self,
+                    _seed: T,
+                ) -> std::result::Result<T::Value, Self::Error>
+                where
+                    T: de::DeserializeSeed<'de>,
+                {
+                    Err(de::Error::custom("newtype_variant not supported"))
+                }
+
+                fn tuple_variant<V>(
+                    self,
+                    _len: usize,
+                    _visitor: V,
+                ) -> std::result::Result<V::Value, Self::Error>
+                where
+                    V: Visitor<'de>,
+                {
+                    Err(de::Error::custom("tuple_variant not supported"))
+                }
+
+                fn struct_variant<V>(
+                    self,
+                    _fields: &'static [&'static str],
+                    _visitor: V,
+                ) -> std::result::Result<V::Value, Self::Error>
+                where
+                    V: Visitor<'de>,
+                {
+                    Err(de::Error::custom("struct_variant not supported"))
+                }
+            }
+
+            match self.value {
+                Value::Text(s) => visitor
+                    .visit_enum(ValueEnumAccess(s))
+                    .map_err(de::Error::custom),
+
+                _ => Err(de::Error::invalid_type(
+                    de::Unexpected::Other(&format!("{:?}", self.value)),
+                    &"a valid sqlite enum representation",
+                )),
             }
         }
     }
@@ -550,34 +773,49 @@ mod serde_ {
         }
     }
 
-    #[test]
-    fn test_deserialize_value() {
-        fn de<'de, T>(value: Value) -> std::result::Result<T, de::value::Error>
-        where
-            T: Deserialize<'de>,
-        {
-            T::deserialize(value.into_deserializer())
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_deserialize_value() {
+            fn de<'de, T>(value: Value) -> std::result::Result<T, de::value::Error>
+            where
+                T: Deserialize<'de>,
+            {
+                T::deserialize(value.into_deserializer())
+            }
+
+            #[derive(Deserialize, Debug, PartialEq)]
+            enum MyEnum {
+                A,
+                B,
+            }
+
+            assert_eq!(de::<MyEnum>(Value::Text("A".to_string())), Ok(MyEnum::A));
+            assert_eq!(de::<()>(Value::Null), Ok(()));
+            assert_eq!(de::<i64>(Value::Integer(123)), Ok(123));
+            assert_eq!(de::<f64>(Value::Real(123.4)), Ok(123.4));
+            assert_eq!(
+                de::<String>(Value::Text("abc".to_string())),
+                Ok("abc".to_string())
+            );
+            assert_eq!(
+                de::<Vec<u8>>(Value::Blob(b"abc".to_vec())),
+                Ok(b"abc".to_vec())
+            );
+
+            assert_eq!(de::<Option<()>>(Value::Null), Ok(None));
+            assert_eq!(de::<Option<Vec<u8>>>(Value::Null), Ok(None));
+            assert_eq!(de::<Option<i64>>(Value::Integer(123)), Ok(Some(123)));
+            assert_eq!(de::<Option<f64>>(Value::Real(123.4)), Ok(Some(123.4)));
+
+            assert!(de::<i64>(Value::Null).is_err());
+            assert!(de::<Vec<u8>>(Value::Null).is_err());
+            assert!(de::<f64>(Value::Blob(b"abc".to_vec())).is_err());
+            assert!(de::<MyEnum>(Value::Text("C".to_string())).is_err());
+
+            assert_eq!(de::<[u8; 2]>(Value::Blob(b"aa".to_vec())), Ok([97, 97]));
         }
-
-        assert_eq!(de::<()>(Value::Null), Ok(()));
-        assert_eq!(de::<i64>(Value::Integer(123)), Ok(123));
-        assert_eq!(de::<f64>(Value::Real(123.4)), Ok(123.4));
-        assert_eq!(
-            de::<String>(Value::Text("abc".to_string())),
-            Ok("abc".to_string())
-        );
-        assert_eq!(
-            de::<Vec<u8>>(Value::Blob(b"abc".to_vec())),
-            Ok(b"abc".to_vec())
-        );
-
-        assert_eq!(de::<Option<()>>(Value::Null), Ok(None));
-        assert_eq!(de::<Option<Vec<u8>>>(Value::Null), Ok(None));
-        assert_eq!(de::<Option<i64>>(Value::Integer(123)), Ok(Some(123)));
-        assert_eq!(de::<Option<f64>>(Value::Real(123.4)), Ok(Some(123.4)));
-
-        assert!(de::<i64>(Value::Null).is_err());
-        assert!(de::<Vec<u8>>(Value::Null).is_err());
-        assert!(de::<f64>(Value::Blob(b"abc".to_vec())).is_err());
     }
 }

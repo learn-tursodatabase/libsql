@@ -1,10 +1,11 @@
-use std::fmt;
 use std::sync::Arc;
+use std::{fmt, path::Path};
 
+use crate::connection::BatchRows;
 use crate::{
     connection::Conn,
     params::Params,
-    rows::{RowInner, RowsInner},
+    rows::{ColumnsInner, RowInner, RowsInner},
     statement::Stmt,
     transaction::Tx,
     Column, Connection, Result, Row, Rows, Statement, Transaction, TransactionBehavior, Value,
@@ -22,8 +23,13 @@ impl Conn for LibsqlConnection {
         self.conn.execute(sql, params)
     }
 
-    async fn execute_batch(&self, sql: &str) -> Result<()> {
+    async fn execute_batch(&self, sql: &str) -> Result<BatchRows> {
         self.conn.execute_batch(sql)
+    }
+
+    async fn execute_transactional_batch(&self, sql: &str) -> Result<BatchRows> {
+        self.conn.execute_transactional_batch(sql)?;
+        Ok(BatchRows::empty())
     }
 
     async fn prepare(&self, sql: &str) -> Result<Statement> {
@@ -48,16 +54,30 @@ impl Conn for LibsqlConnection {
         })
     }
 
-    async fn is_autocommit(&self) -> Result<bool> {
-        Ok(self.conn.is_autocommit())
+    fn is_autocommit(&self) -> bool {
+        self.conn.is_autocommit()
     }
 
     fn changes(&self) -> u64 {
         self.conn.changes()
     }
 
+    fn total_changes(&self) -> u64 {
+        self.conn.total_changes()
+    }
+
     fn last_insert_rowid(&self) -> i64 {
         self.conn.last_insert_rowid()
+    }
+
+    async fn reset(&self) {}
+
+    fn enable_load_extension(&self, onoff: bool) -> Result<()> {
+        self.conn.enable_load_extension(onoff)
+    }
+
+    fn load_extension(&self, dylib_path: &Path, entry_point: Option<&str>) -> Result<()> {
+        self.conn.load_extension(dylib_path, entry_point)
     }
 }
 
@@ -86,9 +106,14 @@ impl Stmt for LibsqlStmt {
         let params = params.clone();
         let stmt = self.0.clone();
 
-        stmt.query(&params)
-            .map(LibsqlRows)
-            .map(|r| Rows { inner: Box::new(r) })
+        stmt.query(&params).map(LibsqlRows).map(Rows::new)
+    }
+
+    async fn run(&mut self, params: &Params) -> Result<()> {
+        let params = params.clone();
+        let stmt = self.0.clone();
+
+        stmt.run(&params)
     }
 
     fn reset(&mut self) {
@@ -125,15 +150,18 @@ impl Tx for LibsqlTx {
 
 pub(crate) struct LibsqlRows(pub(crate) crate::local::Rows);
 
+#[async_trait::async_trait]
 impl RowsInner for LibsqlRows {
-    fn next(&mut self) -> Result<Option<Row>> {
+    async fn next(&mut self) -> Result<Option<Row>> {
         let row = self.0.next()?.map(|r| Row {
             inner: Box::new(LibsqlRow(r)),
         });
 
         Ok(row)
     }
+}
 
+impl ColumnsInner for LibsqlRows {
     fn column_count(&self) -> i32 {
         self.0.column_count()
     }
@@ -154,20 +182,22 @@ impl RowInner for LibsqlRow {
         self.0.get_value(idx)
     }
 
-    fn column_name(&self, idx: i32) -> Option<&str> {
-        self.0.column_name(idx)
-    }
-
     fn column_str(&self, idx: i32) -> Result<&str> {
         self.0.get::<&str>(idx)
+    }
+}
+
+impl ColumnsInner for LibsqlRow {
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.0.column_name(idx)
     }
 
     fn column_type(&self, idx: i32) -> Result<ValueType> {
         self.0.column_type(idx).map(ValueType::from)
     }
 
-    fn column_count(&self) -> usize {
-        self.0.stmt.column_count()
+    fn column_count(&self) -> i32 {
+        self.0.stmt.column_count() as i32
     }
 }
 

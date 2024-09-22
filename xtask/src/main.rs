@@ -18,6 +18,8 @@ fn try_main() -> Result<()> {
         Some("build-wasm") => build_wasm(&arg)?,
         Some("sim-tests") => sim_tests(&arg)?,
         Some("test") => run_tests(&arg)?,
+        Some("test-encryption") => run_tests_encryption(&arg)?,
+        Some("publish") => publish(&arg)?,
         _ => print_help(),
     }
     Ok(())
@@ -31,9 +33,30 @@ build                  builds all languages
 build-wasm             builds the wasm components in wasm32-unknown-unknown
 build-bundled          builds sqlite3 and updates the bundeled code for ffi
 test                   runs the entire libsql test suite using nextest
+test-encryption        runs encryption tests for embedded replicas
 sim-tests <test name>  runs the libsql-server simulation test suite
+publish-cratesio       publish libsql client crates to crates.io
 "
     )
+}
+
+fn publish(arg: &str) -> Result<()> {
+    let pkgs = [
+        "libsql-ffi",
+        "libsql-sqlite3-parser",
+        "libsql-rusqlite",
+        "libsql-sys",
+        "libsql",
+    ];
+
+    for pkg in pkgs {
+        println!("publishing {pkg}");
+        run_cargo(&["publish", "-p", pkg, arg])?;
+    }
+
+    println!("all libsql packges published");
+
+    Ok(())
 }
 
 fn build_wasm(_arg: &str) -> Result<()> {
@@ -56,6 +79,26 @@ fn run_tests(arg: &str) -> Result<()> {
     run_cargo(&["install", "cargo-nextest"])?;
     println!("running nextest run");
     run_cargo(&["nextest", "run", arg])?;
+
+    Ok(())
+}
+
+fn run_tests_encryption(arg: &str) -> Result<()> {
+    println!("installing nextest");
+    run_cargo(&["install", "--force", "cargo-nextest"])?;
+    println!("running nextest run");
+    run_cargo(&[
+        "nextest",
+        "run",
+        "-F",
+        "test-encryption",
+        "-p",
+        "libsql-server",
+        "--test",
+        "tests",
+        "embedded_replica",
+        arg,
+    ])?;
 
     Ok(())
 }

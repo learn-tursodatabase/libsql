@@ -14,14 +14,18 @@ env:
   # we need to fix before we can enable this.
   # RUSTFLAGS: "-D warnings"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     runs-on: ubuntu-latest
     name: Run Checks
     env:
-      RUSTFLAGS: -D warnings
+      RUSTFLAGS: -D warnings --cfg tokio_unstable
     steps:
-      - uses: hecrj/setup-rust-action@v1
+      - uses: hecrj/setup-rust-action@v2
 
       - name: Checkout
         uses: actions/checkout@v3
@@ -76,14 +80,17 @@ jobs:
       - uses: taiki-e/install-action@cargo-udeps
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly hack udeps -p libsql --each-feature
+      - run: RUSTFLAGS="-D warnings --cfg tokio_unstable" cargo check -p libsql --no-default-features --features core 
+      - run: RUSTFLAGS="-D warnings --cfg tokio_unstable" cargo check -p libsql --no-default-features --features replication 
+      - run: RUSTFLAGS="-D warnings --cfg tokio_unstable" cargo check -p libsql --no-default-features --features remote
 
   test:
     runs-on: ubuntu-latest
     name: Run Tests
     env:
-      RUSTFLAGS: -D warnings
+      RUSTFLAGS: -D warnings --cfg tokio_unstable
     steps:
-    - uses: hecrj/setup-rust-action@v1
+    - uses: hecrj/setup-rust-action@v2
 
     # needed because we run out of disk space during tests
     - name: Free Disk Space (Ubuntu)
@@ -123,13 +130,45 @@ jobs:
     - name: Run tests
       run: cargo nextest run
 
+    - name: Run tests with custom pager
+      env:
+        LIBSQL_EXPERIMENTAL_PAGER: 1000
+      run: cargo nextest run
+    - name: clean build dir
+      run: rm -rf libsql-ffi/bundled/SQLite3MultipleCiphers/build
+    - name: embedded replica encryption tests
+      run: cargo xtask test-encryption
+  windows:
+    runs-on: windows-latest
+    name: Windows checks
+    steps:
+      - uses: hecrj/setup-rust-action@v2
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Set up cargo cache
+        uses: actions/cache@v3
+        continue-on-error: false
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: build libsql all features
+        run: cargo build -p libsql --all-features 
+
   # test-rust-wasm:
   #   runs-on: ubuntu-latest
   #   name: Run Rust Wasm Tests
   #   env:
   #     RUSTFLAGS: -D warnings
   #   steps:
-  #     - uses: hecrj/setup-rust-action@v1
+  #     - uses: hecrj/setup-rust-action@v2
   #       with:
   #         targets: [wasm32-unknown-unknown]
 

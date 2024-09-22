@@ -2,16 +2,16 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-
+use std::sync::atomic::AtomicU64;
 use libsql_replication::rpc::proxy::{
-    describe_result, query_result::RowResult, DescribeResult, ExecuteResults, ResultRows,
-    State as RemoteState,
+    describe_result, query_result::RowResult, Cond, DescribeResult, ExecuteResults, NotCond,
+    OkCond, Positional, Query, ResultRows, State as RemoteState, Step,
 };
 use parking_lot::Mutex;
 
 use crate::parser;
 use crate::parser::StmtKind;
-use crate::rows::{RowInner, RowsInner};
+use crate::rows::{ColumnsInner, RowInner, RowsInner};
 use crate::statement::Stmt;
 use crate::transaction::Tx;
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
 };
 use crate::{Column, Row, Rows, Value};
 
-use crate::connection::Conn;
+use crate::connection::{BatchRows, Conn};
 use crate::local::impls::LibsqlConnection;
 
 #[derive(Clone)]
@@ -28,12 +28,14 @@ pub struct RemoteConnection {
     pub(self) local: LibsqlConnection,
     writer: Option<Writer>,
     inner: Arc<Mutex<Inner>>,
+    max_write_replication_index: Arc<AtomicU64>,
 }
 
 #[derive(Default, Debug)]
 struct Inner {
     state: State,
     changes: u64,
+    total_changes: u64,
     last_insert_rowid: i64,
 }
 
@@ -49,6 +51,8 @@ enum State {
 impl State {
     pub fn step(&self, kind: StmtKind) -> State {
         use State;
+
+        tracing::trace!("parser step: {:?} to {:?}", self, kind);
 
         match (*self, kind) {
             (State::TxnReadOnly, StmtKind::TxnBegin)
@@ -66,7 +70,14 @@ impl State {
             (State::Txn, StmtKind::Release) => State::Txn,
             (_, StmtKind::Release) => State::Invalid,
 
-            (state, StmtKind::Other | StmtKind::Write | StmtKind::Read) => state,
+            (
+                state,
+                StmtKind::Other
+                | StmtKind::Write
+                | StmtKind::Read
+                | StmtKind::Attach
+                | StmtKind::Detach,
+            ) => state,
             (State::Invalid, _) => State::Invalid,
 
             (State::Init, StmtKind::TxnBegin) => State::Txn,
@@ -78,7 +89,7 @@ impl State {
     }
 }
 
-/// Given a an initial state and an array of queries, attempts to predict what the final state will
+/// Given an initial state and an array of queries, attempts to predict what the final state will
 /// be
 fn predict_final_state<'a>(
     mut state: State,
@@ -131,12 +142,12 @@ fn should_execute_local(state: &mut State, stmts: &[parser::Statement]) -> Resul
         }
 
         (init, State::Invalid) => {
-            // Panic here because the connection has become invalid and it can no longer be
-            // used
-            panic!(
-                "replication connection has reached an invalid state, started with {:?}",
-                init
-            );
+            let err = Err(Error::InvalidParserState(format!("{:?}", init)));
+
+            // Reset state always back to init so the user can start over
+            *state = State::Init;
+
+            return err;
         }
 
         _ => false,
@@ -156,12 +167,25 @@ impl From<RemoteState> for State {
 }
 
 impl RemoteConnection {
-    pub(crate) fn new(local: LibsqlConnection, writer: Option<Writer>) -> Self {
+    pub(crate) fn new(local: LibsqlConnection, writer: Option<Writer>, max_write_replication_index: Arc<AtomicU64>) -> Self {
         let state = Arc::new(Mutex::new(Inner::default()));
         Self {
             local,
             writer,
             inner: state,
+            max_write_replication_index,
+        }
+    }
+
+    fn update_max_write_replication_index(&self, index: Option<u64>) {
+        if let Some(index) = index {
+            let mut current = self.max_write_replication_index.load(std::sync::atomic::Ordering::SeqCst);
+            while index > current {
+                match self.max_write_replication_index.compare_exchange(current, index, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst) {
+                    Ok(_) => break,
+                    Err(new_current) => current = new_current,
+                }
+            }
         }
     }
 
@@ -191,6 +215,39 @@ impl RemoteConnection {
                 .into();
         }
 
+        self.update_max_write_replication_index(res.current_frame_no);
+
+        if let Some(replicator) = writer.replicator() {
+            replicator.sync_oneshot().await?;
+        }
+
+        Ok(res)
+    }
+
+    pub(self) async fn execute_steps_remote(&self, steps: Vec<Step>) -> Result<ExecuteResults> {
+        let Some(ref writer) = self.writer else {
+            return Err(Error::Misuse(
+                "Cannot delegate write in local replica mode.".into(),
+            ));
+        };
+        let res = writer
+            .execute_steps(steps)
+            .await
+            .map_err(|e| Error::WriteDelegation(e.into()))?;
+
+        {
+            let mut inner = self.inner.lock();
+            inner.state = RemoteState::try_from(res.state)
+                .expect("Invalid state enum")
+                .into();
+        }
+
+        self.update_max_write_replication_index(res.current_frame_no);
+
+        if let Some(replicator) = writer.replicator() {
+            replicator.sync_oneshot().await?;
+        }
+
         Ok(res)
     }
 
@@ -215,6 +272,7 @@ impl RemoteConnection {
             state.last_insert_rowid = *rowid;
         }
 
+        state.total_changes += row.affected_row_count;
         state.changes = row.affected_row_count;
     }
 
@@ -228,7 +286,7 @@ impl RemoteConnection {
     // and will return false if no rollback happened and the
     // execute was valid.
     pub(self) async fn maybe_execute_rollback(&self) -> Result<bool> {
-        if self.inner.lock().state != State::TxnReadOnly && !self.local.is_autocommit().await? {
+        if self.inner.lock().state != State::TxnReadOnly && !self.local.is_autocommit() {
             self.local.execute("ROLLBACK", Params::None).await?;
             Ok(true)
         } else {
@@ -258,7 +316,7 @@ impl Conn for RemoteConnection {
             .results
             .into_iter()
             .next()
-            .expect("Expected atleast one result");
+            .expect("Expected at least one result");
 
         let affected_row_count = match result.row_result {
             Some(RowResult::Row(row)) => {
@@ -278,14 +336,14 @@ impl Conn for RemoteConnection {
         Ok(affected_row_count)
     }
 
-    async fn execute_batch(&self, sql: &str) -> Result<()> {
+    async fn execute_batch(&self, sql: &str) -> Result<BatchRows> {
         let stmts = parser::Statement::parse(sql).collect::<Result<Vec<_>>>()?;
 
         if self.should_execute_local(&stmts[..])? {
             self.local.execute_batch(sql).await?;
 
             if !self.maybe_execute_rollback().await? {
-                return Ok(());
+                return Ok(BatchRows::empty());
             }
         }
 
@@ -305,7 +363,124 @@ impl Conn for RemoteConnection {
             };
         }
 
-        Ok(())
+        Ok(BatchRows::empty())
+    }
+
+    async fn execute_transactional_batch(&self, sql: &str) -> Result<BatchRows> {
+        let mut stmts = Vec::new();
+        let parse = crate::parser::Statement::parse(sql);
+        for s in parse {
+            let s = s?;
+            if s.kind == StmtKind::TxnBegin
+                || s.kind == StmtKind::TxnBeginReadOnly
+                || s.kind == StmtKind::TxnEnd
+            {
+                return Err(Error::TransactionalBatchError(
+                    "Transactions forbidden inside transactional batch".to_string(),
+                ));
+            }
+            stmts.push(s);
+        }
+
+        if self.should_execute_local(&stmts[..])? {
+            self.local.execute_transactional_batch(sql).await?;
+
+            if !self.maybe_execute_rollback().await? {
+                return Ok(BatchRows::empty());
+            }
+        }
+
+        let mut steps = Vec::with_capacity(stmts.len() + 3);
+        steps.push(Step {
+            query: Some(Query {
+                stmt: "BEGIN TRANSACTION".to_string(),
+                params: Some(libsql_replication::rpc::proxy::query::Params::Positional(
+                    Positional::default(),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let count = stmts.len() as i64;
+        for (idx, stmt) in stmts.into_iter().enumerate() {
+            let step = Step {
+                cond: Some(Cond {
+                    cond: Some(libsql_replication::rpc::proxy::cond::Cond::Ok(OkCond {
+                        step: idx as i64,
+                        ..Default::default()
+                    })),
+                }),
+                query: Some(Query {
+                    stmt: stmt.stmt,
+                    params: Some(libsql_replication::rpc::proxy::query::Params::Positional(
+                        Positional::default(),
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            steps.push(step);
+        }
+        steps.push(Step {
+            cond: Some(Cond {
+                cond: Some(libsql_replication::rpc::proxy::cond::Cond::Ok(OkCond {
+                    step: count,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            query: Some(Query {
+                stmt: "COMMIT".to_string(),
+                params: Some(libsql_replication::rpc::proxy::query::Params::Positional(
+                    Positional::default(),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        steps.push(Step {
+            cond: Some(Cond {
+                cond: Some(libsql_replication::rpc::proxy::cond::Cond::Not(Box::new(
+                    NotCond {
+                        cond: Some(Box::new(Cond {
+                            cond: Some(libsql_replication::rpc::proxy::cond::Cond::Ok(OkCond {
+                                step: count + 1,
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            }),
+            query: Some(Query {
+                stmt: "ROLLBACK".to_string(),
+                params: Some(libsql_replication::rpc::proxy::query::Params::Positional(
+                    Positional::default(),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let res = self.execute_steps_remote(steps).await?;
+
+        for result in res.results {
+            match result.row_result {
+                Some(RowResult::Row(row)) => self.update_state(&row),
+                Some(RowResult::Error(e)) => {
+                    return Err(Error::RemoteSqliteFailure(
+                        e.code,
+                        e.extended_code,
+                        e.message,
+                    ))
+                }
+                None => panic!("unexpected empty result row"),
+            };
+        }
+
+        Ok(BatchRows::empty())
     }
 
     async fn prepare(&self, sql: &str) -> Result<Statement> {
@@ -328,17 +503,23 @@ impl Conn for RemoteConnection {
         })
     }
 
-    async fn is_autocommit(&self) -> Result<bool> {
-        Ok(self.is_state_init())
+    fn is_autocommit(&self) -> bool {
+        self.is_state_init()
     }
 
     fn changes(&self) -> u64 {
         self.inner.lock().changes
     }
 
+    fn total_changes(&self) -> u64 {
+        self.inner.lock().total_changes
+    }
+
     fn last_insert_rowid(&self) -> i64 {
         self.inner.lock().last_insert_rowid
     }
+
+    async fn reset(&self) {}
 }
 
 pub struct ColumnMeta {
@@ -465,7 +646,7 @@ impl Stmt for RemoteStatement {
             .results
             .into_iter()
             .next()
-            .expect("Expected atleast one result");
+            .expect("Expected at least one result");
 
         let affected_row_count = match result.row_result {
             Some(RowResult::Row(row)) => {
@@ -499,7 +680,7 @@ impl Stmt for RemoteStatement {
             .results
             .into_iter()
             .next()
-            .expect("Expected atleast one result");
+            .expect("Expected at least one result");
 
         let rows = match result.row_result {
             Some(RowResult::Row(row)) => {
@@ -516,9 +697,34 @@ impl Stmt for RemoteStatement {
             None => panic!("unexpected empty result row"),
         };
 
-        Ok(Rows {
-            inner: Box::new(RemoteRows(rows, 0)),
-        })
+        Ok(Rows::new(RemoteRows(rows, 0)))
+    }
+
+    async fn run(&mut self, params: &Params) -> Result<()> {
+        if let Some(stmt) = &mut self.local_statement {
+            return stmt.run(params.clone()).await;
+        }
+
+        let res = self
+            .conn
+            .execute_remote(self.stmts.clone(), params.clone())
+            .await?;
+
+        for result in res.results {
+            match result.row_result {
+                Some(RowResult::Row(row)) => self.conn.update_state(&row),
+                Some(RowResult::Error(e)) => {
+                    return Err(Error::RemoteSqliteFailure(
+                        e.code,
+                        e.extended_code,
+                        e.message,
+                    ))
+                }
+                None => panic!("unexpected empty result row"),
+            };
+        }
+
+        Ok(())
     }
 
     fn reset(&mut self) {}
@@ -569,8 +775,9 @@ impl Stmt for RemoteStatement {
 
 pub(crate) struct RemoteRows(pub(crate) ResultRows, pub(crate) usize);
 
+#[async_trait::async_trait]
 impl RowsInner for RemoteRows {
-    fn next(&mut self) -> Result<Option<Row>> {
+    async fn next(&mut self) -> Result<Option<Row>> {
         // TODO(lucio): Switch to a vecdeque and reduce allocations
         let cursor = self.1;
         self.1 += 1;
@@ -585,13 +792,15 @@ impl RowsInner for RemoteRows {
         let values = row
             .values
             .iter()
-            .map(|v| bincode::deserialize(&v.data[..]).map_err(Error::from))
+            .map(Value::try_from)
             .collect::<Result<Vec<_>>>()?;
 
         let row = RemoteRow(values, self.0.column_descriptions.clone());
         Ok(Some(row).map(Box::new).map(|inner| Row { inner }))
     }
+}
 
+impl ColumnsInner for RemoteRows {
     fn column_count(&self) -> i32 {
         self.0.column_descriptions.len() as i32
     }
@@ -624,10 +833,6 @@ impl RowInner for RemoteRow {
             .ok_or(Error::InvalidColumnIndex)
     }
 
-    fn column_name(&self, idx: i32) -> Option<&str> {
-        self.1.get(idx as usize).map(|s| s.name.as_str())
-    }
-
     fn column_str(&self, idx: i32) -> Result<&str> {
         let value = self.0.get(idx as usize).ok_or(Error::InvalidColumnIndex)?;
 
@@ -635,6 +840,12 @@ impl RowInner for RemoteRow {
             Value::Text(s) => Ok(s.as_str()),
             _ => Err(Error::InvalidColumnType),
         }
+    }
+}
+
+impl ColumnsInner for RemoteRow {
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.1.get(idx as usize).map(|s| s.name.as_str())
     }
 
     fn column_type(&self, idx: i32) -> Result<ValueType> {
@@ -646,8 +857,8 @@ impl RowInner for RemoteRow {
             .ok_or(Error::InvalidColumnType)
     }
 
-    fn column_count(&self) -> usize {
-        self.1.len()
+    fn column_count(&self) -> i32 {
+        self.1.len() as i32
     }
 }
 

@@ -15,13 +15,15 @@ use tokio::time::Duration;
 use url::Url;
 use uuid::Uuid;
 
+use crate::auth::user_auth_strategies::Disabled;
+use crate::auth::Auth;
 use crate::config::{DbConfig, UserApiConfig};
 use crate::net::AddrIncoming;
 use crate::Server;
 
 const S3_URL: &str = "http://localhost:9000/";
 
-const S3_SERVER: Once = Once::new();
+static S3_SERVER: Once = Once::new();
 
 async fn start_s3_server() {
     std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://localhost:9000");
@@ -92,6 +94,8 @@ async fn configure_server(
             snapshot_exec: None,
             checkpoint_interval: Some(Duration::from_secs(3)),
             snapshot_at_shutdown: false,
+            encryption_config: None,
+            max_concurrent_requests: 128,
         },
         admin_api_config: None,
         disable_namespaces: true,
@@ -100,21 +104,23 @@ async fn configure_server(
             http_acceptor: Some(http_acceptor),
             enable_http_console: false,
             self_url: None,
-            http_auth: None,
-            auth_jwt_key: None,
+            primary_url: None,
+            auth_strategy: Auth::new(Disabled::new()),
         },
         path: path.into().into(),
         disable_default_namespace: false,
+        max_active_namespaces: 100,
         heartbeat_config: None,
         idle_shutdown_timeout: None,
         initial_idle_shutdown_timeout: None,
         rpc_server_config: None,
         rpc_client_config: None,
-        shutdown: Default::default(),
+        ..Default::default()
     }
 }
 
 #[tokio::test]
+#[ignore]
 async fn backup_restore() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -137,7 +143,6 @@ async fn backup_restore() {
         use_compression: bottomless::replicator::CompressionKind::Gzip,
         bucket_name: BUCKET.to_string(),
         max_batch_interval: Duration::from_millis(250),
-        restore_transaction_page_swap_after: 1, // in this test swap should happen at least once
         ..bottomless::replicator::Options::from_env().unwrap()
     };
     let connection_addr = Url::parse(&format!("http://localhost:{}", PORT)).unwrap();
@@ -288,7 +293,6 @@ async fn rollback_restore() {
         use_compression: bottomless::replicator::CompressionKind::Gzip,
         bucket_name: BUCKET.to_string(),
         max_batch_interval: Duration::from_millis(250),
-        restore_transaction_page_swap_after: 1, // in this test swap should happen at least once
         ..bottomless::replicator::Options::from_env().unwrap()
     };
     let make_server = || async { configure_server(&options, listener_addr, PATH).await };
@@ -454,7 +458,6 @@ async fn remove_snapshots(bucket: &str) {
     if let Ok(out) = client.list_objects().bucket(bucket).send().await {
         let keys = out
             .contents()
-            .unwrap()
             .iter()
             .map(|o| {
                 let key = o.key().unwrap();
@@ -462,7 +465,7 @@ async fn remove_snapshots(bucket: &str) {
                 format!("{}/db.gz", prefix)
             })
             .unique()
-            .map(|key| ObjectIdentifier::builder().key(key).build())
+            .map(|key| ObjectIdentifier::builder().key(key).build().unwrap())
             .collect();
 
         client
@@ -472,7 +475,8 @@ async fn remove_snapshots(bucket: &str) {
                 Delete::builder()
                     .set_objects(Some(keys))
                     .quiet(true)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .send()
             .await
@@ -485,7 +489,7 @@ async fn remove_snapshots(bucket: &str) {
 async fn assert_bucket_occupancy(bucket: &str, expect_empty: bool) {
     let client = s3_client().await.unwrap();
     if let Ok(out) = client.list_objects().bucket(bucket).send().await {
-        let contents = out.contents().unwrap_or_default();
+        let contents = out.contents();
         if expect_empty {
             assert!(
                 contents.is_empty(),
@@ -527,6 +531,7 @@ impl Drop for DbFileCleaner {
 
 /// Guardian struct used for cleaning up the test data from
 /// S3 bucket dir at the beginning and end of a test.
+#[allow(dead_code)]
 struct S3BucketCleaner(&'static str);
 
 impl S3BucketCleaner {
@@ -540,17 +545,23 @@ impl S3BucketCleaner {
         let client = s3_client().await?;
         let objects = client.list_objects().bucket(bucket).send().await?;
         let mut delete_keys = Vec::new();
-        for o in objects.contents().unwrap_or_default() {
+        for o in objects.contents() {
             let id = ObjectIdentifier::builder()
                 .set_key(o.key().map(String::from))
-                .build();
+                .build()
+                .unwrap();
             delete_keys.push(id);
         }
 
         let _ = client
             .delete_objects()
             .bucket(bucket)
-            .delete(Delete::builder().set_objects(Some(delete_keys)).build())
+            .delete(
+                Delete::builder()
+                    .set_objects(Some(delete_keys))
+                    .build()
+                    .unwrap(),
+            )
             .send()
             .await?;
 

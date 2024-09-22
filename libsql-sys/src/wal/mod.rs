@@ -6,12 +6,15 @@ use crate::ffi::*;
 
 pub use sqlite3_wal::{Sqlite3Wal, Sqlite3WalManager};
 
+pub mod either;
 pub(crate) mod ffi;
 mod sqlite3_wal;
 pub mod wrapper;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub use ffi::make_wal_manager;
+
+use self::wrapper::{WalWrapper, WrapWal};
 
 pub trait WalManager {
     type Wal: Wal;
@@ -26,6 +29,7 @@ pub trait WalManager {
         max_log_size: i64,
         db_path: &CStr,
     ) -> Result<Self::Wal>;
+
     fn close(
         &self,
         wal: &mut Self::Wal,
@@ -40,6 +44,14 @@ pub trait WalManager {
     fn destroy(self)
     where
         Self: Sized;
+
+    fn wrap<U>(self, wrapper: U) -> WalWrapper<U, Self>
+    where
+        U: WrapWal<Self::Wal> + Clone,
+        Self: Sized,
+    {
+        WalWrapper::new(wrapper, self)
+    }
 }
 
 /// Wrapper type around `*mut sqlite3`, to seal the pointer from extern usage.
@@ -48,7 +60,7 @@ pub struct Sqlite3Db {
 }
 
 impl Sqlite3Db {
-    pub(crate) fn as_ptr(&mut self) -> *mut sqlite3 {
+    pub fn as_ptr(&mut self) -> *mut sqlite3 {
         self.inner
     }
 }
@@ -64,7 +76,7 @@ impl Sqlite3File {
         self.inner
     }
 
-    pub fn read_at(&mut self, buf: &mut [u8], offset: u64) -> Result<()> {
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         unsafe {
             assert!(!self.inner.is_null());
             let inner = &mut *self.inner;
@@ -130,17 +142,37 @@ pub trait BusyHandler {
     fn handle_busy(&mut self) -> bool;
 }
 
+impl<F> BusyHandler for F
+where
+    F: FnMut() -> bool,
+{
+    fn handle_busy(&mut self) -> bool {
+        (self)()
+    }
+}
+
 pub trait UndoHandler {
     fn handle_undo(&mut self, page_no: u32) -> Result<()>;
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
 #[repr(i32)]
 pub enum CheckpointMode {
     Passive = SQLITE_CHECKPOINT_PASSIVE,
     Full = SQLITE_CHECKPOINT_FULL,
     Restart = SQLITE_CHECKPOINT_RESTART,
     Truncate = SQLITE_CHECKPOINT_TRUNCATE,
+}
+
+pub trait CheckpointCallback {
+    fn frame(
+        &mut self,
+        max_safe_frame_no: u32,
+        frame: &[u8],
+        page_no: NonZeroU32,
+        frame_no: NonZeroU32,
+    ) -> Result<()>;
+    fn finish(&mut self) -> Result<()>;
 }
 
 pub trait Wal {
@@ -165,6 +197,8 @@ pub trait Wal {
     fn savepoint(&mut self, rollback_data: &mut [u32]);
     fn savepoint_undo(&mut self, rollback_data: &mut [u32]) -> Result<()>;
 
+    /// Insert frames in the wal. On commit, returns the number of inserted frames for that
+    /// transaction, or 0 for non-commit calls.
     fn insert_frames(
         &mut self,
         page_size: c_int,
@@ -172,18 +206,21 @@ pub trait Wal {
         size_after: u32,
         is_commit: bool,
         sync_flags: c_int,
-    ) -> Result<()>;
+    ) -> Result<usize>;
 
     /// Returns the number of frames in the log and the number of checkpointed frames in the WAL.
-    fn checkpoint<B: BusyHandler>(
+    fn checkpoint(
         &mut self,
         db: &mut Sqlite3Db,
         mode: CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         // temporary scratch buffer
         buf: &mut [u8],
-    ) -> Result<(u32, u32)>;
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>,
+        in_wal: Option<&mut i32>,
+        backfilled: Option<&mut i32>,
+    ) -> Result<()>;
 
     fn exclusive_mode(&mut self, op: c_int) -> Result<()>;
     fn uses_heap_memory(&self) -> bool;
@@ -195,5 +232,5 @@ pub trait Wal {
     /// the last call, then return 0.
     fn callback(&self) -> i32;
 
-    fn last_fame_index(&self) -> u32;
+    fn frames_in_wal(&self) -> u32;
 }

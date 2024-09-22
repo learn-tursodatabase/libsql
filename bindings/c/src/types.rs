@@ -1,3 +1,21 @@
+pub const LIBSQL_INT: i8 = 1;
+pub const LIBSQL_FLOAT: i8 = 2;
+pub const LIBSQL_TEXT: i8 = 3;
+pub const LIBSQL_BLOB: i8 = 4;
+pub const LIBSQL_NULL: i8 = 5;
+
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct libsql_config {
+    pub db_path: *const std::ffi::c_char,
+    pub primary_url: *const std::ffi::c_char,
+    pub auth_token: *const std::ffi::c_char,
+    pub read_your_writes: std::ffi::c_char,
+    pub encryption_key: *const std::ffi::c_char,
+    pub sync_interval: std::ffi::c_int,
+    pub with_webpki: std::ffi::c_char,
+}
+
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct blob {
@@ -93,6 +111,63 @@ impl From<&libsql_connection> for libsql_connection_t {
 #[allow(clippy::from_over_into)]
 impl From<&mut libsql_connection> for libsql_connection_t {
     fn from(value: &mut libsql_connection) -> Self {
+        Self { ptr: value }
+    }
+}
+
+#[repr(C)]
+pub struct replicated {
+    pub frame_no: std::ffi::c_int,
+    pub frames_synced: std::ffi::c_int,
+}
+
+pub struct stmt {
+    pub stmt: libsql::Statement,
+    pub params: Vec<libsql::Value>,
+}
+
+pub struct libsql_stmt {
+    pub stmt: stmt,
+}
+
+#[derive(Clone, Debug)]
+#[repr(transparent)]
+pub struct libsql_stmt_t {
+    ptr: *const libsql_stmt,
+}
+
+impl libsql_stmt_t {
+    pub fn null() -> libsql_stmt_t {
+        libsql_stmt_t {
+            ptr: std::ptr::null(),
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.ptr.is_null()
+    }
+
+    pub fn get_ref(&self) -> &stmt {
+        &unsafe { &*self.ptr }.stmt
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_ref_mut(&self) -> &mut stmt {
+        let ptr_mut = self.ptr as *mut libsql_stmt;
+        &mut unsafe { &mut (*ptr_mut) }.stmt
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl From<&libsql_stmt> for libsql_stmt_t {
+    fn from(value: &libsql_stmt) -> Self {
+        Self { ptr: value }
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl From<&mut libsql_stmt> for libsql_stmt_t {
+    fn from(value: &mut libsql_stmt) -> Self {
         Self { ptr: value }
     }
 }

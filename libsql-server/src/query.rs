@@ -46,7 +46,7 @@ impl TryFrom<rusqlite::types::ValueRef<'_>> for Value {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Query {
     pub stmt: Statement,
     pub params: Params,
@@ -67,7 +67,7 @@ impl ToSql for Value {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Params {
     Named(HashMap<String, Value>),
     Positional(Vec<Value>),
@@ -142,9 +142,17 @@ impl Params {
                 if let Some(value) = maybe_value {
                     stmt.raw_bind_parameter(index, value)?;
                 } else if let Some(name) = param_name {
-                    return Err(anyhow!("value for parameter {} not found", name));
+                    if stmt.is_explain() > 0 {
+                        return Ok(());
+                    } else {
+                        return Err(anyhow!("value for parameter {} not found", name));
+                    }
                 } else {
-                    return Err(anyhow!("value for parameter {} not found", index));
+                    if stmt.is_explain() > 0 {
+                        return Ok(());
+                    } else {
+                        return Err(anyhow!("value for parameter {} not found", index));
+                    }
                 }
             }
         }

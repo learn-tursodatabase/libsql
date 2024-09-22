@@ -1,6 +1,6 @@
 ---
 source: libsql-server/tests/hrana/batch.rs
-expression: resp.json_value().await.unwrap()
+expression: json
 ---
 {
   "result": {
@@ -9,12 +9,15 @@ expression: resp.json_value().await.unwrap()
         "cols": [],
         "rows": [],
         "affected_row_count": 0,
-        "last_insert_rowid": null
+        "last_insert_rowid": null,
+        "replication_index": null,
+        "rows_read": 1,
+        "rows_written": 2
       }
     ],
     "step_errors": [
       null
     ],
-    "replication_index": 1
+    "replication_index": "1"
   }
 }

@@ -188,7 +188,9 @@ globalThis.sqlite3ApiBootstrap.initializers.push(function(sqlite3){
     ["sqlite3_file_control", "int", "sqlite3*", "string", "int", "*"],
     ["sqlite3_finalize", "int", "sqlite3_stmt*"],
     ["sqlite3_free", undefined,"*"],
+    ["sqlite3_get_autocommit", "int", "sqlite3*"],
     ["sqlite3_get_auxdata", "*", "sqlite3_context*", "int"],
+    ["sqlite3_get_autocommit", "int", "sqlite3*"],
     ["sqlite3_initialize", undefined],
     /*["sqlite3_interrupt", undefined, "sqlite3*"
        ^^^ we cannot actually currently support this because JS is

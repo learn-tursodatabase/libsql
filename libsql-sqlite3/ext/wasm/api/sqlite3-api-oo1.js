@@ -1,3 +1,4 @@
+//#ifnot omit-oo1
 /*
   2022-07-22
 
@@ -1271,6 +1272,14 @@ globalThis.sqlite3ApiBootstrap.initializers.push(function(sqlite3){
     */
     checkRc: function(resultCode){
       return checkSqlite3Rc(this, resultCode);
+    },
+
+    getAutocommit: function(){
+      return capi.sqlite3_get_autocommit(this.pointer);
+    },
+
+    lastInsertRowid: function(){
+      return capi.sqlite3_last_insert_rowid(this.pointer);
     }
   }/*DB.prototype*/;
 
@@ -1940,4 +1949,6 @@ globalThis.sqlite3ApiBootstrap.initializers.push(function(sqlite3){
   }/*main-window-only bits*/
 
 });
-
+//#else
+/* Built with the omit-oo1 flag. */
+//#endif ifnot omit-oo1

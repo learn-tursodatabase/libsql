@@ -1,12 +1,13 @@
-use libsql::{Database, Value};
+use libsql::{Builder, Cipher, EncryptionConfig, Value};
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let db_file = tempfile::NamedTempFile::new().unwrap();
-    println!("Database {}", db_file.path().display());
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_file = db_dir.path().join("data.db");
+    println!("Database {}", db_file.display());
 
     let auth_token = std::env::var("LIBSQL_AUTH_TOKEN").unwrap_or_else(|_| {
         println!("Using empty token since LIBSQL_TOKEN was not set");
@@ -15,14 +16,28 @@ async fn main() {
 
     let url = std::env::var("LIBSQL_URL")
         .unwrap_or_else(|_| {
-            println!("Using empty token since LIBSQL_URL was not set");
+            println!("Using http://localhost:8080 LIBSQL_URL was not set");
             "http://localhost:8080".to_string()
         })
         .replace("libsql", "https");
 
-    let db = Database::open_with_remote_sync(db_file.path().to_str().unwrap(), url, auth_token)
-        .await
-        .unwrap();
+    let db = if cfg!(feature = "encryption") {
+        let encryption_config = EncryptionConfig {
+            cipher: Cipher::Aes256Cbc,
+            encryption_key: "s3cr3t".into(),
+        };
+        Builder::new_remote_replica(&db_file, url, auth_token)
+            .encryption_config(encryption_config)
+            .build()
+            .await
+            .unwrap()
+    } else {
+        Builder::new_remote_replica(&db_file, url, auth_token)
+            .build()
+            .await
+            .unwrap()
+    };
+
     let conn = db.connect().unwrap();
 
     let f = db.sync().await.unwrap();
@@ -46,7 +61,7 @@ async fn main() {
             .unwrap();
 
         println!("Rows insert call");
-        while let Some(row) = rows.next().unwrap() {
+        while let Some(row) = rows.next().await.unwrap() {
             println!("Row: {}", row.get_str(0).unwrap());
         }
 
@@ -55,7 +70,7 @@ async fn main() {
         let mut rows = conn.query("SELECT * FROM foo", ()).await.unwrap();
 
         println!("Rows coming from a read after write call");
-        while let Some(row) = rows.next().unwrap() {
+        while let Some(row) = rows.next().await.unwrap() {
             println!("Row: {}", row.get_str(0).unwrap());
         }
 

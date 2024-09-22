@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::time::Duration;
 
 use hyper::{service::make_service_fn, Body, Response, StatusCode};
 use insta::{assert_json_snapshot, assert_snapshot};
@@ -21,7 +22,9 @@ fn load_namespace_from_dump_from_url() {
     INSERT INTO test VALUES(42);
     COMMIT;"#;
 
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
     make_primary(&mut sim, tmp.path().to_path_buf());
 
@@ -56,7 +59,7 @@ fn load_namespace_from_dump_from_url() {
         let foo_conn = foo.connect()?;
         let mut rows = foo_conn.query("select count(*) from test", ()).await?;
         assert!(matches!(
-            rows.next().unwrap().unwrap().get_value(0)?,
+            rows.next().await.unwrap().unwrap().get_value(0)?,
             Value::Integer(1)
         ));
 
@@ -75,7 +78,9 @@ fn load_namespace_from_dump_from_file() {
     INSERT INTO test VALUES(42);
     COMMIT;"#;
 
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -125,7 +130,7 @@ fn load_namespace_from_dump_from_file() {
         let foo_conn = foo.connect()?;
         let mut rows = foo_conn.query("select count(*) from test", ()).await?;
         assert!(matches!(
-            rows.next().unwrap().unwrap().get_value(0)?,
+            rows.next().await.unwrap().unwrap().get_value(0)?,
             Value::Integer(1)
         ));
 
@@ -144,7 +149,9 @@ fn load_namespace_from_no_commit() {
     INSERT INTO test VALUES(42);
     "#;
 
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -193,7 +200,9 @@ fn load_namespace_from_no_txn() {
     COMMIT;
     "#;
 
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -235,7 +244,9 @@ fn load_namespace_from_no_txn() {
 
 #[test]
 fn export_dump() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
 
     make_primary(&mut sim, tmp.path().to_path_buf());
@@ -253,10 +264,10 @@ fn export_dump() {
         foo_conn.execute("create table test (x)", ()).await?;
         foo_conn.execute("insert into test values (42)", ()).await?;
         foo_conn
-            .execute("insert into test values (\"foo\")", ())
+            .execute("insert into test values ('foo')", ())
             .await?;
         foo_conn
-            .execute("insert into test values (\"bar\")", ())
+            .execute("insert into test values ('bar')", ())
             .await?;
 
         let resp = client.get("http://foo.primary:8080/dump").await?;

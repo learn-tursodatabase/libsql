@@ -1,4 +1,5 @@
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("Failed to connect to database: `{0}`")]
     ConnectionFailed(String),
@@ -18,6 +19,8 @@ pub enum Error {
     ToSqlConversionFailure(crate::BoxError),
     #[error("Sync is not supported in databases opened in {0} mode.")]
     SyncNotSupported(String), // Not in rusqlite
+    #[error("Loading extension is only supported in local databases.")]
+    LoadExtensionNotSupported, // Not in rusqlite
     #[error("Column not found: {0}")]
     ColumnNotFound(i32), // Not in rusqlite
     #[error("Hrana: `{0}`")]
@@ -40,6 +43,25 @@ pub enum Error {
     RemoteSqliteFailure(i32, i32, String),
     #[error("replication error: {0}")]
     Replication(crate::BoxError),
+    #[error("path has invalid UTF-8")]
+    InvalidUTF8Path,
+    #[error("freeze is not supported in {0} mode.")]
+    FreezeNotSupported(String),
+    #[error("connection has reached an invalid state, started with {0}")]
+    InvalidParserState(String),
+    #[error("TLS error: {0}")]
+    InvalidTlsConfiguration(std::io::Error),
+    #[error("Transactional batch error: {0}")]
+    TransactionalBatchError(String),
+    #[error("Invalid blob size, expected {0}")]
+    InvalidBlobSize(usize),
+}
+
+#[cfg(feature = "hrana")]
+impl From<crate::hrana::HranaError> for Error {
+    fn from(e: crate::hrana::HranaError) -> Self {
+        Error::Hrana(e.into())
+    }
 }
 
 impl From<std::convert::Infallible> for Error {

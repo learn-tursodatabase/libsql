@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(clippy::mutable_key_type)]
 
 use std::collections::HashMap;
 
@@ -8,6 +9,7 @@ use metrics_util::{
     CompositeKey, MetricKind,
 };
 
+pub mod auth;
 pub mod http;
 pub mod net;
 
@@ -38,9 +40,29 @@ impl MetricsSnapshot {
     }
 
     pub fn get_counter(&self, metric_name: &str) -> Option<u64> {
-        println!("{:?}", self.snapshot);
         for (key, (_, _, val)) in &self.snapshot {
             if key.kind() == MetricKind::Counter && key.key().name() == metric_name {
+                match val {
+                    DebugValue::Counter(v) => return Some(*v),
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn get_counter_label(&self, metric_name: &str, label: (&str, &str)) -> Option<u64> {
+        for (key, (_, _, val)) in &self.snapshot {
+            if key.kind() == MetricKind::Counter && key.key().name() == metric_name {
+                if !key
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == label.0 && l.value() == label.1)
+                {
+                    continue;
+                }
+
                 match val {
                     DebugValue::Counter(v) => return Some(*v),
                     _ => unreachable!(),
@@ -82,6 +104,21 @@ impl MetricsSnapshot {
     pub fn assert_counter(&self, metric_name: &str, value: u64) -> &Self {
         let val = self
             .get_counter(metric_name)
+            .expect("metric does not exist");
+
+        assert_eq!(val, value);
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_counter_label(
+        &self,
+        metric_name: &str,
+        label: (&str, &str),
+        value: u64,
+    ) -> &Self {
+        let val = self
+            .get_counter_label(metric_name, label)
             .expect("metric does not exist");
 
         assert_eq!(val, value);

@@ -1,8 +1,12 @@
+#![allow(clippy::too_many_arguments)]
 pub mod ffi {
+    //! C ffi for libsql.
+
     pub use libsql_ffi::*;
     use zerocopy::byteorder::big_endian::{U16 as bu16, U32 as bu32, U64 as bu64};
 
     /// Patched database header file, in use by libsql
+    #[allow(dead_code)] // <- false positive
     #[repr(C)]
     #[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::FromZeroes, zerocopy::AsBytes, Debug)]
     pub struct Sqlite3DbHeader {
@@ -60,6 +64,7 @@ pub mod ffi {
 #[cfg(feature = "api")]
 pub mod connection;
 pub mod error;
+pub mod name;
 #[cfg(feature = "api")]
 pub mod statement;
 #[cfg(feature = "api")]
@@ -70,7 +75,11 @@ pub mod value;
 pub mod wal;
 
 #[cfg(feature = "api")]
+pub use connection::Cipher;
+#[cfg(feature = "api")]
 pub use connection::Connection;
+#[cfg(feature = "api")]
+pub use connection::EncryptionConfig;
 #[cfg(feature = "api")]
 pub use error::{Error, Result};
 #[cfg(feature = "api")]

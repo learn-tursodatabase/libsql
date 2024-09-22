@@ -363,6 +363,10 @@ static int integrityCheckResultRow(Vdbe *v){
   return addr;
 }
 
+#ifdef LIBSQL_EXTRA_PRAGMAS
+int libsql_extra_pragma(sqlite3* db, const char* zDbName, void* pArg);
+#endif
+
 /*
 ** Process a pragma statement. 
 **
@@ -449,6 +453,11 @@ void sqlite3Pragma(
   aFcntl[3] = 0;
   db->busyHandler.nBusy = 0;
   rc = sqlite3_file_control(db, zDb, SQLITE_FCNTL_PRAGMA, (void*)aFcntl);
+#ifdef LIBSQL_EXTRA_PRAGMAS
+  if(rc == SQLITE_NOTFOUND) {
+    rc = libsql_extra_pragma(db, zDb, (void*)aFcntl);
+  }
+#endif
   if( rc==SQLITE_OK ){
     sqlite3VdbeSetNumCols(v, 1);
     sqlite3VdbeSetColName(v, 0, COLNAME_NAME, aFcntl[0], SQLITE_TRANSIENT);
@@ -1779,7 +1788,8 @@ void sqlite3Pragma(
           if( pVTab->pModule->iVersion<4 ) continue;
           if( pVTab->pModule->xIntegrity==0 ) continue;
           sqlite3VdbeAddOp3(v, OP_VCheck, i, 3, isQuick);
-          sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+          pTab->nTabRef++;
+          sqlite3VdbeAppendP4(v, pTab, P4_TABLEREF);
           a1 = sqlite3VdbeAddOp1(v, OP_IsNull, 3); VdbeCoverage(v);
           integrityCheckResultRow(v);
           sqlite3VdbeJumpHere(v, a1);
@@ -2013,6 +2023,7 @@ void sqlite3Pragma(
             int kk;
             int ckUniq = sqlite3VdbeMakeLabel(pParse);
             if( pPk==pIdx ) continue;
+            if( IsVectorIndex(pIdx) ) continue;
             r1 = sqlite3GenerateIndexKey(pParse, pIdx, iDataCur, 0, 0, &jmp3,
                                          pPrior, r1);
             pPrior = pIdx;
@@ -2097,6 +2108,7 @@ void sqlite3Pragma(
           sqlite3VdbeLoadString(v, 2, "wrong # of entries in index ");
           for(j=0, pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext, j++){
             if( pPk==pIdx ) continue;
+            if( IsVectorIndex(pIdx) ) continue;
             sqlite3VdbeAddOp2(v, OP_Count, iIdxCur+j, 3);
             addr = sqlite3VdbeAddOp3(v, OP_Eq, 8+j, 0, 3); VdbeCoverage(v);
             sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
@@ -2927,7 +2939,7 @@ Module *sqlite3PragmaVtabRegister(sqlite3 *db, const char *zName){
   if( pName==0 ) return 0;
   if( (pName->mPragFlg & (PragFlg_Result0|PragFlg_Result1))==0 ) return 0;
   assert( sqlite3HashFind(&db->aModule, zName)==0 );
-  return sqlite3VtabCreateModule(db, zName, &pragmaVtabModule, NULL, (void*)pName, 0);
+  return sqlite3VtabCreateModule(db, zName, &pragmaVtabModule, (void*)pName, 0);
 }
 
 #endif /* SQLITE_OMIT_VIRTUALTABLE */

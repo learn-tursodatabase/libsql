@@ -1,4 +1,5 @@
 //! Tests for sqld in cluster mode
+#![allow(deprecated)]
 
 use super::common;
 
@@ -16,8 +17,9 @@ use crate::common::{http::Client, net::SimServer, snapshot_metrics};
 
 mod replica_restart;
 mod replication;
+mod schema_dbs;
 
-fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
+pub fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
     init_tracing();
     let tmp = tempdir().unwrap();
     sim.host("primary", move || {
@@ -32,6 +34,7 @@ fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
                     connector: TurmoilConnector,
                     disable_metrics: true,
+                    auth_key: None,
                 }),
                 rpc_server_config: Some(RpcServerConfig {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
@@ -62,6 +65,7 @@ fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
                         connector: TurmoilConnector,
                         disable_metrics: true,
+                        auth_key: None,
                     }),
                     rpc_client_config: Some(RpcClientConfig {
                         remote_url: "http://primary:4567".into(),
@@ -83,7 +87,9 @@ fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
 
 #[test]
 fn proxy_write() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     make_cluster(&mut sim, 1, true);
 
     sim.client("client", async {
@@ -100,7 +106,7 @@ fn proxy_write() {
         let mut rows = conn.query("select count(*) from test", ()).await?;
 
         assert!(matches!(
-            rows.next().unwrap().unwrap().get_value(0).unwrap(),
+            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
             Value::Integer(1)
         ));
 
@@ -115,7 +121,9 @@ fn proxy_write() {
 #[test]
 #[ignore = "libsql client doesn't reuse the stream yet, so we can't do RYW"]
 fn replica_read_write() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     make_cluster(&mut sim, 1, true);
 
     sim.client("client", async {
@@ -128,7 +136,7 @@ fn replica_read_write() {
         let mut rows = conn.query("select count(*) from test", ()).await?;
 
         assert!(matches!(
-            rows.next().unwrap().unwrap().get_value(0).unwrap(),
+            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
             Value::Integer(1)
         ));
 
@@ -141,7 +149,9 @@ fn replica_read_write() {
 #[test]
 fn sync_many_replica() {
     const NUM_REPLICA: usize = 10;
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     make_cluster(&mut sim, NUM_REPLICA, true);
     sim.client("client", async {
         let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
@@ -200,10 +210,27 @@ fn sync_many_replica() {
             let conn = db.connect()?;
             let mut rows = conn.query("select count(*) from test", ()).await?;
             assert!(matches!(
-                rows.next().unwrap().unwrap().get_value(0).unwrap(),
+                rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
                 Value::Integer(1)
             ));
         }
+
+        let client = Client::new();
+
+        let stats = client
+            .get("http://primary:9090/v1/namespaces/default/stats")
+            .await?
+            .json_value()
+            .await
+            .unwrap();
+
+        let stat = stats
+            .get("embedded_replica_frames_replicated")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+
+        assert_eq!(stat, 0);
 
         Ok(())
     });
@@ -213,7 +240,9 @@ fn sync_many_replica() {
 
 #[test]
 fn create_namespace() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     make_cluster(&mut sim, 0, false);
 
     sim.client("client", async {
@@ -239,9 +268,72 @@ fn create_namespace() {
         conn.execute("create table test (x)", ()).await.unwrap();
         let mut rows = conn.query("select count(*) from test", ()).await.unwrap();
         assert!(matches!(
-            rows.next().unwrap().unwrap().get_value(0).unwrap(),
+            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
             Value::Integer(0)
         ));
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn large_proxy_query() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(10000))
+        .tcp_capacity(100000)
+        .build();
+    make_cluster(&mut sim, 1, true);
+
+    sim.client("client", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)
+            .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("create table test (x)", ()).await.unwrap();
+        for _ in 0..5000 {
+            conn.execute("insert into test values (randomblob(1000))", ())
+                .await
+                .unwrap();
+        }
+
+        let db = Database::open_remote_with_connector("http://replica0:8080", "", TurmoilConnector)
+            .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute_batch("begin immediate; select * from test limit (4000)")
+            .await
+            .unwrap();
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn replicate_from_shared_schema() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(10000))
+        .tcp_capacity(100000)
+        .build();
+    make_cluster(&mut sim, 1, true);
+
+    sim.client("client", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)
+            .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("create table test (x)", ()).await.unwrap();
+
+        let db = Database::open_remote_with_connector("http://replica0:8080", "", TurmoilConnector)
+            .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute_batch("select * from sqlite_master;")
+            .await
+            .unwrap();
 
         Ok(())
     });

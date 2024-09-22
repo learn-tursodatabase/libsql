@@ -4,12 +4,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
+use libsql_sys::EncryptionConfig;
 use sha256::try_digest;
 use tokio::time::Duration;
 use tonic::transport::Channel;
 use tower::ServiceExt;
 
-use crate::auth::{self, Auth};
+use crate::auth::{Auth, Disabled};
 use crate::net::{AddrIncoming, Connector};
 
 pub struct RpcClientConfig<C = HttpConnector> {
@@ -19,8 +20,8 @@ pub struct RpcClientConfig<C = HttpConnector> {
 }
 
 impl<C: Connector> RpcClientConfig<C> {
-    pub(crate) async fn configure(self) -> anyhow::Result<(Channel, tonic::transport::Uri)> {
-        let uri = tonic::transport::Uri::from_maybe_shared(self.remote_url)?;
+    pub(crate) async fn configure(&self) -> anyhow::Result<(Channel, tonic::transport::Uri)> {
+        let uri = tonic::transport::Uri::from_maybe_shared(self.remote_url.clone())?;
         let mut builder = Channel::builder(uri.clone());
         if let Some(ref tls_config) = self.tls_config {
             let cert_pem = std::fs::read_to_string(&tls_config.cert)?;
@@ -37,7 +38,8 @@ impl<C: Connector> RpcClientConfig<C> {
             builder = builder.tls_config(tls_config)?;
         }
 
-        let channel = builder.connect_with_connector_lazy(self.connector.map_err(Into::into));
+        let channel =
+            builder.connect_with_connector_lazy(self.connector.clone().map_err(Into::into));
 
         Ok((channel, uri))
     }
@@ -60,8 +62,8 @@ pub struct UserApiConfig<A = AddrIncoming> {
     pub http_acceptor: Option<A>,
     pub enable_http_console: bool,
     pub self_url: Option<String>,
-    pub http_auth: Option<String>,
-    pub auth_jwt_key: Option<String>,
+    pub primary_url: Option<String>,
+    pub auth_strategy: Auth,
 }
 
 impl<A> Default for UserApiConfig<A> {
@@ -71,38 +73,9 @@ impl<A> Default for UserApiConfig<A> {
             http_acceptor: Default::default(),
             enable_http_console: Default::default(),
             self_url: Default::default(),
-            http_auth: Default::default(),
-            auth_jwt_key: Default::default(),
+            primary_url: Default::default(),
+            auth_strategy: Auth::new(Disabled::new()),
         }
-    }
-}
-
-impl<A> UserApiConfig<A> {
-    pub fn get_auth(&self) -> anyhow::Result<Auth> {
-        let mut auth = Auth::default();
-
-        if let Some(arg) = self.http_auth.as_deref() {
-            if let Some(param) = auth::parse_http_basic_auth_arg(arg)? {
-                auth.http_basic = Some(param);
-                tracing::info!("Using legacy HTTP basic authentication");
-            }
-        }
-
-        if let Some(jwt_key) = self.auth_jwt_key.as_deref() {
-            let jwt_key =
-                auth::parse_jwt_key(jwt_key).context("Could not parse JWT decoding key")?;
-            auth.jwt_key = Some(jwt_key);
-            tracing::info!("Using JWT-based authentication");
-        }
-
-        auth.disabled = auth.http_basic.is_none() && auth.jwt_key.is_none();
-        if auth.disabled {
-            tracing::warn!(
-                "No authentication specified, the server will not require authentication"
-            )
-        }
-
-        Ok(auth)
     }
 }
 
@@ -110,6 +83,7 @@ pub struct AdminApiConfig<A = AddrIncoming, C = HttpsConnector<HttpConnector>> {
     pub acceptor: A,
     pub connector: C,
     pub disable_metrics: bool,
+    pub auth_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -125,6 +99,8 @@ pub struct DbConfig {
     pub snapshot_exec: Option<String>,
     pub checkpoint_interval: Option<Duration>,
     pub snapshot_at_shutdown: bool,
+    pub encryption_config: Option<EncryptionConfig>,
+    pub max_concurrent_requests: u64,
 }
 
 impl Default for DbConfig {
@@ -141,6 +117,8 @@ impl Default for DbConfig {
             snapshot_exec: None,
             checkpoint_interval: None,
             snapshot_at_shutdown: false,
+            encryption_config: None,
+            max_concurrent_requests: 128,
         }
     }
 }
@@ -197,4 +175,24 @@ pub struct HeartbeatConfig {
     pub heartbeat_url: Option<String>,
     pub heartbeat_period: Duration,
     pub heartbeat_auth: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetaStoreConfig {
+    pub bottomless: Option<BottomlessConfig>,
+    pub allow_recover_from_fs: bool,
+    /// Destroy the metastore if there is a restore error
+    pub destroy_on_error: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BottomlessConfig {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+    pub region: String,
+    pub backup_id: String,
+    pub bucket_name: String,
+    pub backup_interval: Duration,
+    pub bucket_endpoint: String,
 }

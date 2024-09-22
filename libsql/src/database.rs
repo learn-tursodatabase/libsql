@@ -1,9 +1,21 @@
-use std::fmt;
+#![allow(deprecated)]
+
+mod builder;
+
+pub use builder::Builder;
+
+#[cfg(feature = "core")]
+pub use libsql_sys::{Cipher, EncryptionConfig};
 
 use crate::{Connection, Result};
+use std::fmt;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 cfg_core! {
     bitflags::bitflags! {
+        /// Flags that can be passed to libsql to open a database in specific
+        /// modes.
         #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
         #[repr(C)]
         pub struct OpenFlags: ::std::os::raw::c_int {
@@ -21,16 +33,20 @@ cfg_core! {
     }
 }
 
-// TODO(lucio): Improve construction via
-//      1) Move open errors into open fn rather than connect
-//      2) Support replication setup
 enum DbType {
     #[cfg(feature = "core")]
-    Memory,
+    Memory { db: crate::local::Database },
     #[cfg(feature = "core")]
-    File { path: String, flags: OpenFlags },
+    File {
+        path: String,
+        flags: OpenFlags,
+        encryption_config: Option<EncryptionConfig>,
+    },
     #[cfg(feature = "replication")]
-    Sync { db: crate::local::Database },
+    Sync {
+        db: crate::local::Database,
+        encryption_config: Option<EncryptionConfig>,
+    },
     #[cfg(feature = "remote")]
     Remote {
         url: String,
@@ -45,7 +61,7 @@ impl fmt::Debug for DbType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             #[cfg(feature = "core")]
-            Self::Memory => write!(f, "Memory"),
+            Self::Memory { .. } => write!(f, "Memory"),
             #[cfg(feature = "core")]
             Self::File { .. } => write!(f, "File"),
             #[cfg(feature = "replication")]
@@ -57,28 +73,44 @@ impl fmt::Debug for DbType {
     }
 }
 
+/// A struct that knows how to build [`Connection`]'s, this type does
+/// not do much work until the [`Database::connect`] fn is called.
 pub struct Database {
     db_type: DbType,
+    /// The maximum replication index returned from a write performed using any connection created using this Database object.
+    #[allow(dead_code)]
+    max_write_replication_index: Arc<AtomicU64>,
 }
 
 cfg_core! {
     impl Database {
+        /// Open an in-memory libsql database.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
         pub fn open_in_memory() -> Result<Self> {
+            let db = crate::local::Database::open(":memory:", OpenFlags::default())?;
+
             Ok(Database {
-                db_type: DbType::Memory,
+                db_type: DbType::Memory { db },
+                max_write_replication_index: Default::default(),
             })
         }
 
+        /// Open a file backed libsql database.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
         pub fn open(db_path: impl Into<String>) -> Result<Database> {
             Database::open_with_flags(db_path, OpenFlags::default())
         }
 
+        /// Open a file backed libsql database with flags.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
         pub fn open_with_flags(db_path: impl Into<String>, flags: OpenFlags) -> Result<Database> {
             Ok(Database {
                 db_type: DbType::File {
                     path: db_path.into(),
                     flags,
+                    encryption_config: None,
                 },
+                max_write_replication_index: Default::default(),
             })
         }
     }
@@ -91,47 +123,53 @@ cfg_replication! {
 
     impl Database {
         /// Open a local database file with the ability to sync from snapshots from local filesystem.
-        pub async fn open_with_local_sync(db_path: impl Into<String>) -> Result<Database> {
-            let db = crate::local::Database::open_local_sync(db_path, OpenFlags::default()).await?;
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
+        pub async fn open_with_local_sync(
+            db_path: impl Into<String>,
+            encryption_config: Option<EncryptionConfig>
+        ) -> Result<Database> {
+            let db = crate::local::Database::open_local_sync(
+                db_path,
+                OpenFlags::default(),
+                encryption_config.clone()
+            ).await?;
 
             Ok(Database {
-                db_type: DbType::Sync { db },
+                db_type: DbType::Sync { db, encryption_config },
+                max_write_replication_index: Default::default(),
             })
         }
 
-        /// Open a local database file with the ability to sync from a remote database.
-        pub async fn open_with_remote_sync(
-            db_path: impl Into<String>,
-            url: impl Into<String>,
-            token: impl Into<String>,
-        ) -> Result<Database> {
-            let mut http = hyper::client::HttpConnector::new();
-            http.enforce_http(false);
-            http.set_nodelay(true);
 
-            Self::open_with_remote_sync_connector(db_path, url, token, http).await
+        /// Open a local database file with the ability to sync from snapshots from local filesystem
+        /// and forward writes to the provided endpoint.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
+        pub async fn open_with_local_sync_remote_writes(
+            db_path: impl Into<String>,
+            endpoint: String,
+            auth_token: String,
+            encryption_config: Option<EncryptionConfig>,
+        ) -> Result<Database> {
+            let https = connector()?;
+
+            Self::open_with_local_sync_remote_writes_connector(
+                db_path,
+                endpoint,
+                auth_token,
+                https,
+                encryption_config
+            ).await
         }
 
-        #[doc(hidden)]
-        pub async fn open_with_remote_sync_internal(
+        /// Open a local database file with the ability to sync from snapshots from local filesystem
+        /// and forward writes to the provided endpoint and a custom http connector.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
+        pub async fn open_with_local_sync_remote_writes_connector<C>(
             db_path: impl Into<String>,
-            url: impl Into<String>,
-            token: impl Into<String>,
-            version: Option<String>
-        ) -> Result<Database> {
-            let mut http = hyper::client::HttpConnector::new();
-            http.enforce_http(false);
-            http.set_nodelay(true);
-
-            Self::open_with_remote_sync_connector_internal(db_path, url, token, http, version).await
-        }
-
-        #[doc(hidden)]
-        pub async fn open_with_remote_sync_connector<C>(
-            db_path: impl Into<String>,
-            url: impl Into<String>,
-            token: impl Into<String>,
+            endpoint: String,
+            auth_token: String,
             connector: C,
+            encryption_config: Option<EncryptionConfig>,
         ) -> Result<Database>
         where
             C: tower::Service<http::Uri> + Send + Clone + Sync + 'static,
@@ -139,7 +177,112 @@ cfg_replication! {
             C::Future: Send + 'static,
             C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
         {
-            Self::open_with_remote_sync_connector_internal(db_path, url, token, connector, None).await
+            use tower::ServiceExt;
+
+            let svc = connector
+                .map_err(|e| e.into())
+                .map_response(|s| Box::new(s) as Box<dyn crate::util::Socket>);
+
+            let svc = crate::util::ConnectorService::new(svc);
+
+            let db = crate::local::Database::open_local_sync_remote_writes(
+                svc,
+                db_path.into(),
+                endpoint,
+                auth_token,
+                None,
+                OpenFlags::default(),
+                encryption_config.clone(),
+                None,
+            ).await?;
+
+            Ok(Database {
+                db_type: DbType::Sync { db, encryption_config },
+                max_write_replication_index: Default::default(),
+            })
+        }
+
+        /// Open a local database file with the ability to sync from a remote database.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
+        pub async fn open_with_remote_sync(
+            db_path: impl Into<String>,
+            url: impl Into<String>,
+            token: impl Into<String>,
+            encryption_config: Option<EncryptionConfig>,
+        ) -> Result<Database> {
+            let https = connector()?;
+
+            Self::open_with_remote_sync_connector(db_path, url, token, https, false, encryption_config).await
+        }
+
+        /// Open a local database file with the ability to sync from a remote database
+        /// in consistent mode.
+        ///
+        /// Consistent mode means that when a write happens it will not complete until
+        /// that write is visible in the local db.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
+        pub async fn open_with_remote_sync_consistent(
+            db_path: impl Into<String>,
+            url: impl Into<String>,
+            token: impl Into<String>,
+            encryption_config: Option<EncryptionConfig>,
+        ) -> Result<Database> {
+            let https = connector()?;
+
+            Self::open_with_remote_sync_connector(db_path, url, token, https, true, encryption_config).await
+        }
+
+        /// Connect an embedded replica to a remote primary with a custom
+        /// http connector.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
+        pub async fn open_with_remote_sync_connector<C>(
+            db_path: impl Into<String>,
+            url: impl Into<String>,
+            token: impl Into<String>,
+            connector: C,
+            read_your_writes: bool,
+            encryption_config: Option<EncryptionConfig>,
+        ) -> Result<Database>
+        where
+            C: tower::Service<http::Uri> + Send + Clone + Sync + 'static,
+            C::Response: crate::util::Socket,
+            C::Future: Send + 'static,
+            C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        {
+            Self::open_with_remote_sync_connector_internal(
+                db_path,
+                url,
+                token,
+                connector,
+                None,
+                read_your_writes,
+                encryption_config,
+                None
+            ).await
+        }
+
+        #[doc(hidden)]
+        pub async fn open_with_remote_sync_internal(
+            db_path: impl Into<String>,
+            url: impl Into<String>,
+            token: impl Into<String>,
+            version: Option<String>,
+            read_your_writes: bool,
+            encryption_config: Option<EncryptionConfig>,
+            sync_interval: Option<std::time::Duration>,
+        ) -> Result<Database> {
+            let https = connector()?;
+
+            Self::open_with_remote_sync_connector_internal(
+                db_path,
+                url,
+                token,
+                https,
+                version,
+                read_your_writes,
+                encryption_config,
+                sync_interval
+            ).await
         }
 
         #[doc(hidden)]
@@ -148,7 +291,10 @@ cfg_replication! {
             url: impl Into<String>,
             token: impl Into<String>,
             connector: C,
-            version: Option<String>
+            version: Option<String>,
+            read_your_writes: bool,
+            encryption_config: Option<EncryptionConfig>,
+            sync_interval: Option<std::time::Duration>,
         ) -> Result<Database>
         where
             C: tower::Service<http::Uri> + Send + Clone + Sync + 'static,
@@ -169,29 +315,45 @@ cfg_replication! {
                 db_path.into(),
                 url.into(),
                 token.into(),
-                version
+                version,
+                read_your_writes,
+                encryption_config.clone(),
+                sync_interval,
+                None,
+                None
             ).await?;
 
             Ok(Database {
-                db_type: DbType::Sync { db },
+                db_type: DbType::Sync { db, encryption_config },
+                max_write_replication_index: Default::default(),
             })
         }
 
 
-        /// Sync database from remote, and returns the commited frame_no after syncing, if
+        /// Sync database from remote, and returns the committed frame_no after syncing, if
         /// applicable.
-        pub async fn sync(&self) -> Result<Option<FrameNo>> {
-            if let DbType::Sync { db } = &self.db_type {
+        pub async fn sync(&self) -> Result<crate::replication::Replicated> {
+            if let DbType::Sync { db, encryption_config: _ } = &self.db_type {
                 db.sync().await
             } else {
                 Err(Error::SyncNotSupported(format!("{:?}", self.db_type)))
             }
         }
 
-        /// Apply a set of frames to the database and returns the commited frame_no after syncing, if
+        /// Sync database from remote until it gets to a given replication_index or further,
+        /// and returns the committed frame_no after syncing, if applicable.
+        pub async fn sync_until(&self, replication_index: FrameNo) -> Result<crate::replication::Replicated> {
+            if let DbType::Sync { db, encryption_config: _ } = &self.db_type {
+                db.sync_until(replication_index).await
+            } else {
+                Err(Error::SyncNotSupported(format!("{:?}", self.db_type)))
+            }
+        }
+
+        /// Apply a set of frames to the database and returns the committed frame_no after syncing, if
         /// applicable.
         pub async fn sync_frames(&self, frames: crate::replication::Frames) -> Result<Option<FrameNo>> {
-            if let DbType::Sync { db } = &self.db_type {
+            if let DbType::Sync { db, encryption_config: _ } = &self.db_type {
                 db.sync_frames(frames).await
             } else {
                 Err(Error::SyncNotSupported(format!("{:?}", self.db_type)))
@@ -201,10 +363,51 @@ cfg_replication! {
         /// Force buffered replication frames to be applied, and return the current commit frame_no
         /// if applicable.
         pub async fn flush_replicator(&self) -> Result<Option<FrameNo>> {
-            if let DbType::Sync { db } = &self.db_type {
+            if let DbType::Sync { db, encryption_config: _ } = &self.db_type {
                 db.flush_replicator().await
             } else {
                 Err(Error::SyncNotSupported(format!("{:?}", self.db_type)))
+            }
+        }
+
+        /// Returns the database currently committed replication index
+        pub async fn replication_index(&self) -> Result<Option<FrameNo>> {
+            if let DbType::Sync { db, encryption_config: _ } = &self.db_type {
+                db.replication_index().await
+            } else {
+                Err(Error::SyncNotSupported(format!("{:?}", self.db_type)))
+            }
+        }
+
+        /// Freeze this embedded replica and convert it into a regular
+        /// non-embedded replica database.
+        ///
+        /// # Error
+        ///
+        /// Returns `FreezeNotSupported` if the database is not configured in
+        /// embedded replica mode.
+        pub fn freeze(self) -> Result<Database> {
+           match self.db_type {
+               DbType::Sync { db, .. } => {
+                   let path = db.path().to_string();
+                   Ok(Database {
+                       db_type: DbType::File { path, flags: OpenFlags::default(), encryption_config: None},
+                       max_write_replication_index: Default::default(),
+                   })
+               }
+               t => Err(Error::FreezeNotSupported(format!("{:?}", t)))
+           }
+        }
+
+        /// Get the maximum replication index returned from a write performed using any connection created using this Database object.
+        pub fn max_write_replication_index(&self) -> Option<FrameNo> {
+            let index = self
+                .max_write_replication_index
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if index == 0 {
+                None
+            } else {
+                Some(index)
             }
         }
     }
@@ -214,11 +417,12 @@ impl Database {}
 
 cfg_remote! {
     impl Database {
+        /// Open a remote based HTTP database using libsql's hrana protocol.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
         pub fn open_remote(url: impl Into<String>, auth_token: impl Into<String>) -> Result<Self> {
-            let mut connector = hyper::client::HttpConnector::new();
-            connector.enforce_http(false);
+            let https = connector()?;
 
-            Self::open_remote_with_connector_internal(url, auth_token, connector, None)
+            Self::open_remote_with_connector_internal(url, auth_token, https, None)
         }
 
         #[doc(hidden)]
@@ -227,14 +431,13 @@ cfg_remote! {
             auth_token: impl Into<String>,
             version: impl Into<String>,
         ) -> Result<Self> {
-            let mut connector = hyper::client::HttpConnector::new();
-            connector.enforce_http(false);
+            let https = connector()?;
 
-            Self::open_remote_with_connector_internal(url, auth_token, connector, Some(version.into()))
+            Self::open_remote_with_connector_internal(url, auth_token, https, Some(version.into()))
         }
 
-        // For now, only expose this for sqld testing purposes
-        #[doc(hidden)]
+        /// Connect to a remote libsql using libsql's hrana protocol with a custom connector.
+        #[deprecated = "Use the new `Builder` to construct `Database`"]
         pub fn open_remote_with_connector<C>(
             url: impl Into<String>,
             auth_token: impl Into<String>,
@@ -249,6 +452,7 @@ cfg_remote! {
             Self::open_remote_with_connector_internal(url, auth_token, connector, None)
         }
 
+        #[doc(hidden)]
         fn open_remote_with_connector_internal<C>(
             url: impl Into<String>,
             auth_token: impl Into<String>,
@@ -273,20 +477,29 @@ cfg_remote! {
                     connector: crate::util::ConnectorService::new(svc),
                     version,
                 },
+                max_write_replication_index: Default::default(),
             })
         }
     }
 }
 
 impl Database {
+    /// Connect to the database this can mean a few things depending on how it was constructed:
+    ///
+    /// - When constructed with `open`/`open_with_flags`/`open_in_memory` this will call into the
+    ///     libsql C ffi and create a connection to the libsql database.
+    /// - When constructed with `open_remote` and friends it will not call any C ffi and will
+    ///     lazily create a HTTP connection to the provided endpoint.
+    /// - When constructed with `open_with_remote_sync_` and friends it will attempt to perform a
+    ///     handshake with the remote server and will attempt to replicate the remote database
+    ///     locally.
     #[allow(unreachable_patterns)]
     pub fn connect(&self) -> Result<Connection> {
         match &self.db_type {
             #[cfg(feature = "core")]
-            DbType::Memory => {
+            DbType::Memory { db } => {
                 use crate::local::impls::LibsqlConnection;
 
-                let db = crate::local::Database::open(":memory:", OpenFlags::default())?;
                 let conn = db.connect()?;
 
                 let conn = std::sync::Arc::new(LibsqlConnection { conn });
@@ -295,11 +508,41 @@ impl Database {
             }
 
             #[cfg(feature = "core")]
-            DbType::File { path, flags } => {
+            DbType::File {
+                path,
+                flags,
+                encryption_config,
+            } => {
                 use crate::local::impls::LibsqlConnection;
 
                 let db = crate::local::Database::open(path, *flags)?;
                 let conn = db.connect()?;
+
+                if !cfg!(feature = "encryption") && encryption_config.is_some() {
+                    return Err(crate::Error::Misuse(
+                        "Encryption is not enabled: enable the `encryption` feature in order to enable encryption-at-rest".to_string(),
+                    ));
+                }
+
+                #[cfg(feature = "encryption")]
+                if let Some(cfg) = encryption_config {
+                    if unsafe {
+                        libsql_sys::connection::set_encryption_cipher(conn.raw, cfg.cipher_id())
+                    } == -1
+                    {
+                        return Err(crate::Error::Misuse(
+                            "failed to set encryption cipher".to_string(),
+                        ));
+                    }
+                    if unsafe {
+                        libsql_sys::connection::set_encryption_key(conn.raw, &cfg.encryption_key)
+                    } != crate::ffi::SQLITE_OK
+                    {
+                        return Err(crate::Error::Misuse(
+                            "failed to set encryption key".to_string(),
+                        ));
+                    }
+                }
 
                 let conn = std::sync::Arc::new(LibsqlConnection { conn });
 
@@ -307,14 +550,46 @@ impl Database {
             }
 
             #[cfg(feature = "replication")]
-            DbType::Sync { db } => {
+            DbType::Sync {
+                db,
+                encryption_config,
+            } => {
                 use crate::local::impls::LibsqlConnection;
 
                 let conn = db.connect()?;
 
+                if !cfg!(feature = "encryption") && encryption_config.is_some() {
+                    return Err(crate::Error::Misuse(
+                        "Encryption is not enabled: enable the `encryption` feature in order to enable encryption-at-rest".to_string(),
+                    ));
+                }
+                #[cfg(feature = "encryption")]
+                if let Some(cfg) = encryption_config {
+                    if unsafe {
+                        libsql_sys::connection::set_encryption_cipher(conn.raw, cfg.cipher_id())
+                    } == -1
+                    {
+                        return Err(crate::Error::Misuse(
+                            "failed to set encryption cipher".to_string(),
+                        ));
+                    }
+                    if unsafe {
+                        libsql_sys::connection::set_encryption_key(conn.raw, &cfg.encryption_key)
+                    } != crate::ffi::SQLITE_OK
+                    {
+                        return Err(crate::Error::Misuse(
+                            "failed to set encryption key".to_string(),
+                        ));
+                    }
+                }
+
                 let local = LibsqlConnection { conn };
-                let writer = local.conn.writer().cloned();
-                let remote = crate::replication::RemoteConnection::new(local, writer);
+                let writer = local.conn.new_connection_writer();
+                let remote = crate::replication::RemoteConnection::new(
+                    local,
+                    writer,
+                    self.max_write_replication_index.clone(),
+                );
                 let conn = std::sync::Arc::new(remote);
 
                 Ok(Connection { conn })
@@ -341,5 +616,36 @@ impl Database {
 
             _ => unreachable!("no database type set"),
         }
+    }
+}
+
+#[cfg(any(
+    all(feature = "tls", feature = "replication"),
+    all(feature = "tls", feature = "remote")
+))]
+fn connector() -> Result<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>> {
+    let mut http = hyper::client::HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
+
+    Ok(hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .map_err(crate::Error::InvalidTlsConfiguration)?
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http))
+}
+
+#[cfg(any(
+    all(not(feature = "tls"), feature = "replication"),
+    all(not(feature = "tls"), feature = "remote")
+))]
+fn connector() -> Result<hyper::client::HttpConnector> {
+    panic!("The `tls` feature is disabled, you must provide your own http connector");
+}
+
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Database").finish()
     }
 }

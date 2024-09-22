@@ -1,30 +1,28 @@
 use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, Path};
+use base64::prelude::*;
 use hyper::http::request::Parts;
 use hyper::HeaderMap;
+use libsql_replication::rpc::replication::NAMESPACE_METADATA_KEY;
 
 use crate::auth::Authenticated;
 use crate::connection::MakeConnection;
-use crate::database::Database;
+use crate::database::Connection;
 use crate::error::Error;
-use crate::namespace::{MakeNamespace, NamespaceName};
+use crate::namespace::NamespaceName;
 
 use super::AppState;
 
-pub struct MakeConnectionExtractor<D>(pub Arc<dyn MakeConnection<Connection = D>>);
+pub struct MakeConnectionExtractor(pub Arc<dyn MakeConnection<Connection = Connection>>);
 
 #[async_trait::async_trait]
-impl<F> FromRequestParts<AppState<F>>
-    for MakeConnectionExtractor<<F::Database as Database>::Connection>
-where
-    F: MakeNamespace,
-{
+impl FromRequestParts<AppState> for MakeConnectionExtractor {
     type Rejection = Error;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState<F>,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let auth = Authenticated::from_request_parts(parts, state).await?;
         let ns = namespace_from_headers(
@@ -50,17 +48,60 @@ pub fn namespace_from_headers(
         return Ok(NamespaceName::default());
     }
 
-    let host = headers
-        .get("host")
-        .ok_or_else(|| Error::InvalidHost("missing host header".into()))?
-        .as_bytes();
-    let host_str = std::str::from_utf8(host)
-        .map_err(|_| Error::InvalidHost("host header is not valid UTF-8".into()))?;
+    if let Some(from_metadata) = headers.get(NAMESPACE_METADATA_KEY) {
+        try_namespace_from_metadata(from_metadata)
+    } else if let Some(from_host) = headers.get("host") {
+        try_namespace_from_host(from_host, disable_default_namespace)
+    } else if !disable_default_namespace {
+        Ok(NamespaceName::default())
+    } else {
+        Err(Error::InvalidHost("missing host header".into()))
+    }
+}
 
-    match split_namespace(host_str) {
-        Ok(ns) => Ok(ns),
-        Err(_) if !disable_default_namespace => Ok(NamespaceName::default()),
-        Err(e) => Err(e),
+fn try_namespace_from_host(
+    from_host: &axum::http::HeaderValue,
+    disable_default_namespace: bool,
+) -> Result<NamespaceName, Error> {
+    std::str::from_utf8(from_host.as_bytes())
+        .map_err(|_| Error::InvalidHost("host header is not valid UTF-8".into()))
+        .and_then(|h| match split_namespace(h) {
+            Err(_) if !disable_default_namespace => Ok(NamespaceName::default()),
+            r => r,
+        })
+}
+
+fn try_namespace_from_metadata(metadata: &axum::http::HeaderValue) -> Result<NamespaceName, Error> {
+    metadata
+        .to_str()
+        .map_err(|s| Error::InvalidNamespaceBytes(Box::new(s)))
+        .and_then(|encoded| {
+            BASE64_STANDARD_NO_PAD
+                .decode(encoded)
+                .map_err(|e| Error::InvalidNamespaceBytes(Box::new(e)))
+        })
+        .and_then(|ns| NamespaceName::from_bytes(ns.into()))
+}
+
+pub struct MakeConnectionExtractorPath(pub Arc<dyn MakeConnection<Connection = Connection>>);
+#[async_trait::async_trait]
+impl FromRequestParts<AppState> for MakeConnectionExtractorPath {
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = Authenticated::from_request_parts(parts, state).await?;
+        let Path((ns, _)) = Path::<(NamespaceName, String)>::from_request_parts(parts, state)
+            .await
+            .map_err(|e| Error::InvalidPath(e.to_string()))?;
+        Ok(Self(
+            state
+                .namespaces
+                .with_authenticated(ns, auth, |ns| ns.db.connection_maker())
+                .await?,
+        ))
     }
 }
 

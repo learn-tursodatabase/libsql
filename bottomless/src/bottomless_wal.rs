@@ -1,197 +1,114 @@
-use std::ffi::{c_int, CStr};
-use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::ffi::c_int;
+use std::sync::Arc;
+use std::time::Instant;
 
 use libsql_sys::ffi::{SQLITE_BUSY, SQLITE_IOERR_WRITE};
+use libsql_sys::wal::wrapper::{WalWrapper, WrapWal};
 use libsql_sys::wal::{
-    CheckpointMode, Error, PageHeaders, Result, Sqlite3Db, Sqlite3File, UndoHandler, Vfs, Wal,
-    WalManager,
+    BusyHandler, CheckpointCallback, CheckpointMode, Error, Result, Sqlite3Db, Wal,
 };
+use tokio::sync::Mutex;
 
 use crate::replicator::Replicator;
 
+pub type BottomlessWal<T> = WalWrapper<BottomlessWalWrapper, T>;
+
 #[derive(Clone)]
-pub struct CreateBottomlessWal<T> {
-    inner: T,
+pub struct BottomlessWalWrapper {
     replicator: Arc<Mutex<Option<Replicator>>>,
 }
 
-impl<T> CreateBottomlessWal<T> {
-    pub fn new(inner: T, replicator: Replicator) -> Self {
-        Self {
-            inner,
-            replicator: Arc::new(Mutex::new(Some(replicator))),
-        }
+impl BottomlessWalWrapper {
+    pub fn new(replicator: Arc<Mutex<Option<Replicator>>>) -> Self {
+        Self { replicator }
     }
 
-    pub fn shutdown(&self) -> Option<Replicator> {
-        self.replicator.lock().unwrap().take()
+    pub fn replicator(&self) -> Arc<tokio::sync::Mutex<Option<Replicator>>> {
+        self.replicator.clone()
     }
 
-    pub fn inner(&self) -> &T {
-        &self.inner
+    pub async fn shutdown(&self) -> Option<Replicator> {
+        self.replicator.lock().await.take()
     }
 }
 
-impl<T: WalManager> WalManager for CreateBottomlessWal<T> {
-    type Wal = BottomlessWal<T::Wal>;
+impl<T: Wal> WrapWal<T> for BottomlessWalWrapper {
+    fn savepoint_undo(
+        &mut self,
+        wrapped: &mut T,
+        rollback_data: &mut [u32],
+    ) -> libsql_sys::wal::Result<()> {
+        wrapped.savepoint_undo(rollback_data)?;
 
-    fn use_shared_memory(&self) -> bool {
-        self.inner.use_shared_memory()
-    }
-
-    fn open(
-        &self,
-        vfs: &mut Vfs,
-        file: &mut Sqlite3File,
-        no_shm_mode: c_int,
-        max_log_size: i64,
-        db_path: &CStr,
-    ) -> Result<Self::Wal> {
-        let inner = self
-            .inner
-            .open(vfs, file, no_shm_mode, max_log_size, db_path)?;
-        Ok(Self::Wal {
-            inner,
-            replicator: self.replicator.clone(),
-        })
-    }
-
-    fn close(
-        &self,
-        wal: &mut Self::Wal,
-        db: &mut Sqlite3Db,
-        sync_flags: c_int,
-        scratch: Option<&mut [u8]>,
-    ) -> Result<()> {
-        self.inner.close(&mut wal.inner, db, sync_flags, scratch)
-    }
-
-    fn destroy_log(&self, vfs: &mut Vfs, db_path: &CStr) -> Result<()> {
-        self.inner.destroy_log(vfs, db_path)
-    }
-
-    fn log_exists(&self, vfs: &mut Vfs, db_path: &CStr) -> Result<bool> {
-        self.inner.log_exists(vfs, db_path)
-    }
-
-    fn destroy(self)
-    where
-        Self: Sized,
-    {
-        self.inner.destroy()
-    }
-}
-
-pub struct BottomlessWal<T> {
-    inner: T,
-    replicator: Arc<Mutex<Option<Replicator>>>,
-}
-
-impl<T> BottomlessWal<T> {
-    fn try_with_replicator<Ret>(&self, f: impl FnOnce(&mut Replicator) -> Ret) -> Result<Ret> {
-        let mut lock = self.replicator.lock().unwrap();
-        match &mut *lock {
-            Some(replicator) => Ok(f(replicator)),
-            None => Err(Error::new(SQLITE_IOERR_WRITE)),
-        }
-    }
-}
-
-impl<T: Wal> Wal for BottomlessWal<T> {
-    fn limit(&mut self, size: i64) {
-        self.inner.limit(size)
-    }
-
-    fn begin_read_txn(&mut self) -> Result<bool> {
-        self.inner.begin_read_txn()
-    }
-
-    fn end_read_txn(&mut self) {
-        self.inner.end_read_txn()
-    }
-
-    fn find_frame(&mut self, page_no: NonZeroU32) -> Result<Option<NonZeroU32>> {
-        self.inner.find_frame(page_no)
-    }
-
-    fn read_frame(&mut self, frame_no: NonZeroU32, buffer: &mut [u8]) -> Result<()> {
-        self.inner.read_frame(frame_no, buffer)
-    }
-
-    fn db_size(&self) -> u32 {
-        self.inner.db_size()
-    }
-
-    fn begin_write_txn(&mut self) -> Result<()> {
-        self.inner.begin_write_txn()
-    }
-
-    fn end_write_txn(&mut self) -> Result<()> {
-        self.inner.end_write_txn()
-    }
-
-    fn undo<U: UndoHandler>(&mut self, undo_handler: Option<&mut U>) -> Result<()> {
-        self.inner.undo(undo_handler)
-    }
-
-    fn savepoint(&mut self, rollback_data: &mut [u32]) {
-        self.inner.savepoint(rollback_data)
-    }
-
-    fn savepoint_undo(&mut self, rollback_data: &mut [u32]) -> Result<()> {
-        self.inner.savepoint_undo(rollback_data)?;
-
-        {
-            let last_valid_frame = rollback_data[0];
-            self.try_with_replicator(|replicator| {
-                let prev_valid_frame = replicator.peek_last_valid_frame();
-                tracing::trace!(
-                    "Savepoint: rolling back from frame {prev_valid_frame} to {last_valid_frame}",
-                );
-            })?;
-        }
+        let last_valid_frame = rollback_data[0];
+        let runtime = tokio::runtime::Handle::current();
+        runtime.block_on(async {
+            let mut guard = self.replicator.lock().await;
+            match &mut *guard {
+                Some(replicator) => {
+                    let prev_valid_frame = replicator.peek_last_valid_frame();
+                    tracing::trace!(
+                        "Savepoint: rolling back from frame {prev_valid_frame} to {last_valid_frame}",
+                    );
+                    Ok(())
+                }
+                None => {
+                    Err(Error::new(SQLITE_IOERR_WRITE))
+                }
+            }
+        })?;
 
         Ok(())
     }
 
     fn insert_frames(
         &mut self,
-        page_size: c_int,
-        page_headers: &mut PageHeaders,
+        wrapped: &mut T,
+        page_size: std::ffi::c_int,
+        page_headers: &mut libsql_sys::wal::PageHeaders,
         size_after: u32,
         is_commit: bool,
         sync_flags: c_int,
-    ) -> Result<()> {
-        let last_valid_frame = self.inner.last_fame_index();
+    ) -> Result<usize> {
+        let last_valid_frame = wrapped.frames_in_wal();
 
-        self.inner
-            .insert_frames(page_size, page_headers, size_after, is_commit, sync_flags)?;
+        let num_frames =
+            wrapped.insert_frames(page_size, page_headers, size_after, is_commit, sync_flags)?;
 
-        self.try_with_replicator(|replicator| {
-            if let Err(e) = replicator.set_page_size(page_size as usize) {
-                tracing::error!("fatal error during backup: {e}, exiting");
-                std::process::abort()
+        let mut guard = self.replicator.blocking_lock();
+        match &mut *guard {
+            Some(replicator) => {
+                if let Err(e) = replicator.set_page_size(page_size as usize) {
+                    tracing::error!("fatal error during backup: {e}, exiting");
+                    std::process::abort()
+                }
+                replicator.register_last_valid_frame(last_valid_frame);
+                let new_valid_valid_frame_index = wrapped.frames_in_wal();
+                replicator.submit_frames(new_valid_valid_frame_index - last_valid_frame);
             }
-            replicator.register_last_valid_frame(last_valid_frame);
-            let new_valid_valid_frame_index = self.inner.last_fame_index();
-            replicator.submit_frames(new_valid_valid_frame_index - last_valid_frame);
-        })?;
+            None => return Err(Error::new(SQLITE_IOERR_WRITE)),
+        }
 
-        Ok(())
+        Ok(num_frames)
     }
 
-    fn checkpoint<B: libsql_sys::wal::BusyHandler>(
+    #[tracing::instrument(skip_all, fields(in_wal = in_wal, backfilled = backfilled))]
+    fn checkpoint(
         &mut self,
+        wrapped: &mut T,
         db: &mut Sqlite3Db,
         mode: CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         // temporary scratch buffer
         buf: &mut [u8],
-    ) -> Result<(u32, u32)> {
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>,
+        in_wal: Option<&mut i32>,
+        backfilled: Option<&mut i32>,
+    ) -> Result<()> {
+        let before = Instant::now();
         {
-            tracing::trace!("bottomless checkpoint");
+            tracing::trace!("bottomless checkpoint: {mode:?}");
 
             /* In order to avoid partial checkpoints, passive checkpoint
              ** mode is not allowed. Only TRUNCATE checkpoints are accepted,
@@ -208,79 +125,101 @@ impl<T: Wal> Wal for BottomlessWal<T> {
             }
         }
 
-        #[allow(clippy::await_holding_lock)]
-        // uncontended -> only gets called under a libSQL write lock
-        {
-            let runtime = tokio::runtime::Handle::current();
-            self.try_with_replicator(|replicator| {
-                let last_known_frame = replicator.last_known_frame();
-                replicator.request_flush();
-                if last_known_frame == 0 {
-                    tracing::debug!("No committed changes in this generation, not snapshotting");
-                    replicator.skip_snapshot_for_current_generation();
-                    return Err(Error::new(SQLITE_BUSY));
-                }
-                if let Err(e) = runtime.block_on(replicator.wait_until_committed(last_known_frame))
-                {
-                    tracing::error!(
-                        "Failed to wait for S3 replicator to confirm {} frames backup: {}",
-                        last_known_frame,
-                        e
+        let runtime = tokio::runtime::Handle::current();
+        runtime.block_on(async {
+            let mut guard = self.replicator.lock().await;
+            match &mut *guard {
+                Some(replicator) => {
+                    let last_known_frame = replicator.last_known_frame();
+                    replicator.request_flush();
+                    if last_known_frame == 0 {
+                        tracing::debug!(
+                            "No committed changes in this generation, not snapshotting"
+                        );
+                        replicator.skip_snapshot_for_current_generation();
+                        return Err(Error::new(SQLITE_BUSY));
+                    }
+
+                    let fut = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        replicator.wait_until_committed(last_known_frame),
                     );
-                    return Err(Error::new(SQLITE_IOERR_WRITE));
+
+                    match fut.await {
+                        Ok(Ok(_)) => (),
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                "Failed to wait for S3 replicator to confirm {} frames backup: {}",
+                                last_known_frame,
+                                e
+                            );
+                            return Err(Error::new(SQLITE_IOERR_WRITE));
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                "timed out waiting for S3 replicator to confirm committed frames."
+                            );
+                            return Err(Error::new(SQLITE_BUSY));
+                        }
+                    }
+                    tracing::debug!("commited after {:?}", before.elapsed());
+                    let snapshotted = replicator.is_snapshotted().await;
+                    if !snapshotted {
+                        tracing::warn!("previous generation not snapshotted, skipping checkpoint");
+                        return Err(Error::new(SQLITE_BUSY));
+                    }
+                    tracing::debug!("snapshotted after {:?}", before.elapsed());
+
+                    Ok(())
                 }
-                if let Err(e) = runtime.block_on(replicator.wait_until_snapshotted()) {
-                    tracing::error!(
-                        "Failed to wait for S3 replicator to confirm database snapshot backup: {}",
-                        e
-                    );
-                    return Err(Error::new(SQLITE_IOERR_WRITE));
+                None => Err(Error::new(SQLITE_IOERR_WRITE)),
+            }
+        })?;
+
+        wrapped.checkpoint(
+            db,
+            mode,
+            busy_handler,
+            sync_flags,
+            buf,
+            checkpoint_cb,
+            in_wal,
+            backfilled,
+        )?;
+
+        tracing::debug!("underlying checkpoint call after {:?}", before.elapsed());
+
+        runtime.block_on(async {
+            let mut guard = self.replicator.lock().await;
+            match &mut *guard {
+                Some(replicator) => {
+                    replicator.new_generation().await;
+                    if let Err(e) = replicator.snapshot_main_db_file(false).await {
+                        tracing::error!(
+                            "Failed to snapshot the main db file during checkpoint: {e}"
+                        );
+                        return Err(Error::new(SQLITE_IOERR_WRITE));
+                    }
+                    Ok(())
                 }
+                None => Err(Error::new(SQLITE_IOERR_WRITE)),
+            }
+        })?;
 
-                Ok(())
-            })??;
-        }
+        tracing::debug!("checkpoint finnished after {:?}", before.elapsed());
 
-        let ret = self
-            .inner
-            .checkpoint(db, mode, busy_handler, sync_flags, buf)?;
-
-        #[allow(clippy::await_holding_lock)]
-        // uncontended -> only gets called under a libSQL write lock
-        {
-            let runtime = tokio::runtime::Handle::current();
-            self.try_with_replicator(|replicator| {
-                let _prev = replicator.new_generation();
-                if let Err(e) =
-                    runtime.block_on(async move { replicator.snapshot_main_db_file().await })
-                {
-                    tracing::error!("Failed to snapshot the main db file during checkpoint: {e}");
-                    return Err(Error::new(SQLITE_IOERR_WRITE));
-                }
-                Ok(())
-            })??;
-        }
-
-        Ok(ret)
+        Ok(())
     }
 
-    fn exclusive_mode(&mut self, op: c_int) -> Result<()> {
-        self.inner.exclusive_mode(op)
-    }
-
-    fn uses_heap_memory(&self) -> bool {
-        self.inner.uses_heap_memory()
-    }
-
-    fn set_db(&mut self, db: &mut Sqlite3Db) {
-        self.inner.set_db(db)
-    }
-
-    fn callback(&self) -> i32 {
-        self.inner.callback()
-    }
-
-    fn last_fame_index(&self) -> u32 {
-        self.inner.last_fame_index()
+    fn close<M: libsql_sys::wal::WalManager<Wal = T>>(
+        &mut self,
+        manager: &M,
+        wrapped: &mut T,
+        db: &mut libsql_sys::wal::Sqlite3Db,
+        sync_flags: c_int,
+        _scratch: Option<&mut [u8]>,
+    ) -> libsql_sys::wal::Result<()> {
+        // prevent unmonitored checkpoints
+        manager.close(wrapped, db, sync_flags, None)
     }
 }

@@ -1,10 +1,22 @@
-use libsql::{Database, Frames, SnapshotFile};
+use libsql::{
+    replication::{Frames, SnapshotFile},
+    Builder,
+};
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let db = Database::open_with_local_sync("test.db").await.unwrap();
+    let db = Builder::new_local_replica("test.db")
+        .http_request_callback(|r| {
+            let _uri = r.uri_mut();
+
+            // You can modify any part of the http request you would like including headers
+            // and the URI.
+        })
+        .build()
+        .await
+        .unwrap();
     let conn = db.connect().unwrap();
 
     let args = std::env::args().collect::<Vec<String>>();
@@ -22,7 +34,7 @@ async fn main() {
                 "Applying snapshot to local database: {}\n",
                 snapshot_path.display()
             );
-            let snapshot = SnapshotFile::open(&snapshot_path).await.unwrap();
+            let snapshot = SnapshotFile::open(&snapshot_path, None).await.unwrap();
             match db.sync_frames(Frames::Snapshot(snapshot)).await {
                 Ok(n) => println!(
                     "{} applied, new commit index: {n:?}",
@@ -36,7 +48,7 @@ async fn main() {
         }
 
         let mut rows = conn.query("SELECT * FROM sqlite_master", ()).await.unwrap();
-        while let Ok(Some(row)) = rows.next() {
+        while let Ok(Some(row)) = rows.next().await {
             println!(
                 "| {:024} | {:024} | {:024} | {:024} |",
                 row.get_str(0).unwrap(),

@@ -4,8 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::auth::Authenticated;
-use crate::connection::{Connection, MakeConnection};
+use crate::connection::{MakeConnection, RequestContext};
 use crate::hrana;
 
 use super::db_factory::MakeConnectionExtractor;
@@ -24,9 +23,9 @@ pub async fn handle_index() -> hyper::Response<hyper::Body> {
         .unwrap()
 }
 
-pub(crate) async fn handle_execute<D: Connection>(
-    MakeConnectionExtractor(factory): MakeConnectionExtractor<D>,
-    auth: Authenticated,
+pub(crate) async fn handle_execute(
+    MakeConnectionExtractor(factory): MakeConnectionExtractor,
+    ctx: RequestContext,
     req: hyper::Request<hyper::Body>,
 ) -> crate::Result<hyper::Response<hyper::Body>> {
     #[derive(Debug, Deserialize)]
@@ -46,7 +45,7 @@ pub(crate) async fn handle_execute<D: Connection>(
             hrana::Version::Hrana1,
         )
         .map_err(catch_stmt_error)?;
-        hrana::stmt::execute_stmt(&db, auth, query, req_body.stmt.replication_index)
+        hrana::stmt::execute_stmt(&db, ctx, query, req_body.stmt.replication_index)
             .await
             .map(|result| RespBody { result })
             .map_err(catch_stmt_error)
@@ -57,9 +56,9 @@ pub(crate) async fn handle_execute<D: Connection>(
     Ok(res)
 }
 
-pub(crate) async fn handle_batch<D: Connection>(
-    MakeConnectionExtractor(factory): MakeConnectionExtractor<D>,
-    auth: Authenticated,
+pub(crate) async fn handle_batch(
+    MakeConnectionExtractor(factory): MakeConnectionExtractor,
+    ctx: RequestContext,
     req: hyper::Request<hyper::Body>,
 ) -> crate::Result<hyper::Response<hyper::Body>> {
     #[derive(Debug, Deserialize)]
@@ -79,7 +78,7 @@ pub(crate) async fn handle_batch<D: Connection>(
             hrana::Version::Hrana1,
         )
         .map_err(catch_stmt_error)?;
-        hrana::batch::execute_batch(&db, auth, pgm, req_body.batch.replication_index)
+        hrana::batch::execute_batch(&db, ctx, pgm, req_body.batch.replication_index)
             .await
             .map(|result| RespBody { result })
             .context("Could not execute batch")

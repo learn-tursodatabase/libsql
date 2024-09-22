@@ -1,3 +1,5 @@
+//! Deserialization utilities.
+
 use crate::{Row, Value};
 use serde::de::{value::Error as DeError, Error, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -66,7 +68,7 @@ impl<'de> Deserializer<'de> for RowDeserializer<'de> {
 
         visitor.visit_map(RowMapAccess {
             row: self.row,
-            idx: 0..self.row.inner.column_count(),
+            idx: 0..(self.row.inner.column_count() as usize),
             value: None,
         })
     }

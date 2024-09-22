@@ -50,7 +50,7 @@ if (process.env.CRSQLITE_NOPREBUILD) {
       break;
   }
 
-  const binaryUrl = `https://github.com/vlcn-io/cr-sqlite/releases/download/${version}/crsqlite-${os}-${arch}.${ext}`;
+  const binaryUrl = `https://github.com/vlcn-io/cr-sqlite/releases/download/${version}/crsqlite-${os}-${arch}.zip`;
   console.log(`Look for prebuilt binary from ${binaryUrl}`);
   const distPath = join("dist", `crsqlite.${ext}`);
 
@@ -88,13 +88,30 @@ if (process.env.CRSQLITE_NOPREBUILD) {
       return;
     }
 
-    const file = fs.createWriteStream(distPath);
+    const file = fs.createWriteStream(join("dist", "crsqlite.zip"));
     res.pipe(file);
     file.on("finish", () => {
       file.close();
       console.log("Prebuilt binary downloaded");
-      process.exit(0);
+      process.chdir(join(".", "dist"));
+      exec("unzip crsqlite.zip", (err, stdout, stderr) => {
+        if (err) {
+          console.log("Error extracting");
+          console.log(err.message);
+          process.exit(1);
+        }
+        if (stderr) {
+          console.log(stderr);
+        }
+        console.log("Prebuilt binary extracted");
+        process.exit(0);
+      });
     });
+    // unzipper incorrectly unzips the file -- it becomes unloadable by sqlite.
+    // res.pipe(unzipper.Extract({ path: join(".", "dist") })).on("close", () => {
+    //   console.log("Prebuilt binary downloaded");
+    //   process.exit(0);
+    // });
   });
 }
 

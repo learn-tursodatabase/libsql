@@ -50,6 +50,19 @@ impl Statement {
         Ok(MappedRows::new(rows, f))
     }
 
+    pub fn run(&self, params: &Params) -> Result<()> {
+        self.bind(params);
+        let err = self.inner.step();
+        match err {
+            crate::ffi::SQLITE_DONE => Ok(()),
+            crate::ffi::SQLITE_ROW => Ok(()),
+            _ => Err(Error::SqliteFailure(
+                errors::extended_error_code(self.conn.raw),
+                errors::error_from_handle(self.conn.raw),
+            )),
+        }
+    }
+
     pub fn query(&self, params: &Params) -> Result<Rows> {
         self.bind(params);
         let err = self.inner.step();
@@ -208,11 +221,12 @@ impl Statement {
         }
     }
 
-    pub(crate) fn step(&self) -> Result<()> {
+    /// Returns true if this statement has rows ready to be read.
+    pub(crate) fn step(&self) -> Result<bool> {
         let err = self.inner.step();
         match err {
-            crate::ffi::SQLITE_DONE => Ok(()),
-            crate::ffi::SQLITE_ROW => Err(Error::ExecuteReturnedRows),
+            crate::ffi::SQLITE_DONE => Ok(false),
+            crate::ffi::SQLITE_ROW => Ok(true),
             _ => Err(Error::SqliteFailure(
                 errors::extended_error_code(self.conn.raw),
                 errors::error_from_handle(self.conn.raw),
@@ -236,15 +250,15 @@ impl Statement {
     /// sure that current statement has already been stepped once before
     /// calling this method.
     pub fn column_names(&self) -> Vec<&str> {
-        let n = self.column_count();
-        let mut cols = Vec::with_capacity(n);
-        for i in 0..n {
-            let s = self.column_name(i);
-            if let Some(s) = s {
-                cols.push(s);
-            }
-        }
-        cols
+       let n = self.column_count();
+       let mut cols = Vec::with_capacity(n);
+       for i in 0..n {
+           let s = self.column_name(i);
+           if let Some(s) = s {
+               cols.push(s);
+           }
+       }
+       cols
     }
 
     /// Return the number of columns in the result set returned by the prepared
@@ -300,12 +314,11 @@ impl Statement {
     /// the specified `name`.
     pub fn column_index(&self, name: &str) -> Result<usize> {
         let bytes = name.as_bytes();
-        let n = self.column_count() as i32;
+        let n = self.column_count();
         for i in 0..n {
             // Note: `column_name` is only fallible if `i` is out of bounds,
             // which we've already checked.
             let col_name = self
-                .inner
                 .column_name(i)
                 .ok_or_else(|| Error::InvalidColumnName(name.to_string()))?;
             if bytes.eq_ignore_ascii_case(col_name.as_bytes()) {

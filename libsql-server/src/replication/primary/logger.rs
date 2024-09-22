@@ -8,8 +8,11 @@ use std::sync::Arc;
 
 use anyhow::{bail, ensure};
 use bytes::{Bytes, BytesMut};
-use libsql_replication::frame::{Frame, FrameHeader, FrameMut};
+use chrono::{DateTime, Utc};
+use libsql_replication::frame::{Frame, FrameBorrowed, FrameHeader, FrameMut};
 use libsql_replication::snapshot::SnapshotFile;
+use libsql_sys::EncryptionConfig;
+use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::ffi::SQLITE_CHECKPOINT_TRUNCATE;
 use tokio::sync::watch;
@@ -21,9 +24,17 @@ use zerocopy::byteorder::little_endian::{
 };
 use zerocopy::{AsBytes, FromBytes};
 
+use crate::namespace::NamespaceName;
+use crate::replication::script_backup_manager::ScriptBackupManager;
 use crate::replication::snapshot::{find_snapshot_file, LogCompactor};
-use crate::replication::{FrameNo, SnapshotCallback, CRC_64_GO_ISO, WAL_MAGIC};
+use crate::replication::{FrameNo, CRC_64_GO_ISO, WAL_MAGIC};
 use crate::LIBSQL_PAGE_SIZE;
+
+pub use libsql_replication::FrameEncryptor;
+
+static REPLICATION_LATENCY_CACHE_SIZE: Lazy<u64> = Lazy::new(|| {
+    std::env::var("SQLD_REPLICATION_LATENCY_CACHE_SIZE").map_or(100, |s| s.parse().unwrap_or(100))
+});
 
 #[derive(PartialEq, Eq)]
 struct Version([u16; 4]);
@@ -69,6 +80,10 @@ pub struct LogFile {
 
     /// checksum of the last committed frame
     commited_checksum: u64,
+
+    /// Encryption layer
+    encryption: Option<FrameEncryptor>,
+    encryption_buf: BytesMut,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -89,6 +104,7 @@ impl LogFile {
         file: File,
         max_log_frame_count: u64,
         max_log_duration: Option<Duration>,
+        encryption: Option<FrameEncryptor>,
     ) -> anyhow::Result<Self> {
         // FIXME: we should probably take a lock on this file, to prevent anybody else to write to
         // it.
@@ -110,6 +126,11 @@ impl LogFile {
             Self::read_header(&file)?
         };
 
+        let encryption_buf = if encryption.is_some() {
+            BytesMut::with_capacity(LIBSQL_PAGE_SIZE as usize)
+        } else {
+            BytesMut::new()
+        };
         let mut this = Self {
             file,
             header,
@@ -119,6 +140,8 @@ impl LogFile {
             uncommitted_frame_count: 0,
             uncommitted_checksum: 0,
             commited_checksum: 0,
+            encryption,
+            encryption_buf,
         };
 
         if file_end == 0 {
@@ -209,7 +232,8 @@ impl LogFile {
         }))
     }
 
-    pub fn into_rev_stream_mut(self) -> impl Stream<Item = anyhow::Result<FrameMut>> {
+    // NOTICE: Frames are yielded as is, without decrypting their contents. Headers are not encrypted anyway.
+    pub fn into_not_decrypted_rev_stream_mut(self) -> impl Stream<Item = anyhow::Result<FrameMut>> {
         let mut current_frame_offset = self.header.frame_count.get();
         let file = Arc::new(Mutex::new(self));
         async_stream::try_stream! {
@@ -221,7 +245,7 @@ impl LogFile {
                 let read_byte_offset = Self::absolute_byte_offset(current_frame_offset);
                 let frame = tokio::task::spawn_blocking({
                     let file = file.clone();
-                    move || file.lock().read_frame_byte_offset_mut(read_byte_offset)
+                    move || file.lock().read_not_decrypted_frame_byte_offset_mut(read_byte_offset)
                 }).await??;
                 yield frame
             }
@@ -236,6 +260,14 @@ impl LogFile {
 
     pub fn push_page(&mut self, page: &WalPage) -> anyhow::Result<()> {
         let checksum = self.compute_checksum(page);
+        let data = if let Some(encryption) = &self.encryption {
+            self.encryption_buf.clear();
+            self.encryption_buf.extend_from_slice(&page.data);
+            encryption.encrypt(self.encryption_buf.as_mut())?;
+            self.encryption_buf.as_ref()
+        } else {
+            &page.data
+        };
         let frame = Frame::from_parts(
             &FrameHeader {
                 frame_no: self.next_frame_no().into(),
@@ -243,7 +275,7 @@ impl LogFile {
                 page_no: page.page_no.into(),
                 size_after: page.size_after.into(),
             },
-            &page.data,
+            &data,
         );
 
         let byte_offset = self.next_byte_offset();
@@ -342,7 +374,12 @@ impl LogFile {
             .write(true)
             .create(true)
             .open(&to_compact_log_path)?;
-        let mut new_log_file = LogFile::new(file, self.max_log_frame_count, self.max_log_duration)?;
+        let mut new_log_file = LogFile::new(
+            file,
+            self.max_log_frame_count,
+            self.max_log_duration,
+            self.encryption.clone(),
+        )?;
         let new_header = LogFileHeader {
             start_frame_no: (self.header.last_frame_no().unwrap() + 1).into(),
             frame_count: 0.into(),
@@ -361,10 +398,21 @@ impl LogFile {
     }
 
     fn read_frame_byte_offset_mut(&self, offset: u64) -> anyhow::Result<FrameMut> {
-        let mut buffer = BytesMut::zeroed(LogFile::FRAME_SIZE);
-        self.file.read_exact_at(&mut buffer, offset)?;
+        use zerocopy::FromZeroes;
+        let mut frame = FrameBorrowed::new_zeroed();
+        self.file.read_exact_at(frame.as_bytes_mut(), offset)?;
+        if let Some(encryption) = &self.encryption {
+            encryption.decrypt(frame.page_mut())?;
+        }
+        Ok(frame.into())
+    }
 
-        Ok(FrameMut::try_from(&*buffer)?)
+    fn read_not_decrypted_frame_byte_offset_mut(&self, offset: u64) -> anyhow::Result<FrameMut> {
+        use zerocopy::FromZeroes;
+        let mut frame = FrameBorrowed::new_zeroed();
+        self.file.read_exact_at(frame.as_bytes_mut(), offset)?;
+
+        Ok(frame.into())
     }
 
     fn last_commited_frame_no(&self) -> Option<FrameNo> {
@@ -380,7 +428,12 @@ impl LogFile {
         let max_log_duration = self.max_log_duration;
         // truncate file
         self.file.set_len(0)?;
-        Self::new(self.file, max_log_frame_count, max_log_duration)
+        let encryption = self.encryption;
+        Self::new(self.file, max_log_frame_count, max_log_duration, encryption)
+    }
+
+    pub fn set_encryptor(&mut self, encryption: Option<FrameEncryptor>) -> Option<FrameEncryptor> {
+        std::mem::replace(&mut self.encryption, encryption)
     }
 }
 
@@ -392,14 +445,16 @@ fn atomic_rename(p1: impl AsRef<Path>, p2: impl AsRef<Path>) -> anyhow::Result<(
     use nix::libc::renamex_np;
     use nix::libc::RENAME_SWAP;
 
-    let p1 = CString::new(p1.as_ref().as_os_str().as_bytes())?;
-    let p2 = CString::new(p2.as_ref().as_os_str().as_bytes())?;
+    let cp1 = CString::new(p1.as_ref().as_os_str().as_bytes())?;
+    let cp2 = CString::new(p2.as_ref().as_os_str().as_bytes())?;
     unsafe {
-        let ret = renamex_np(p1.as_ptr(), p2.as_ptr(), RENAME_SWAP);
+        let ret = renamex_np(cp1.as_ptr(), cp2.as_ptr(), RENAME_SWAP);
 
         if ret != 0 {
             bail!(
-                "failed to perform snapshot file swap: {ret}, errno: {}",
+                "failed to perform snapshot file swap {} -> {}: {ret}, errno: {}",
+                p1.as_ref().display(),
+                p2.as_ref().display(),
                 std::io::Error::last_os_error()
             );
         }
@@ -420,7 +475,13 @@ fn atomic_rename(p1: impl AsRef<Path>, p2: impl AsRef<Path>) -> anyhow::Result<(
         p2.as_ref(),
         RenameFlags::RENAME_EXCHANGE,
     )
-    .context("failed to perform snapshot file swap")?;
+    .with_context(|| {
+        format!(
+            "failed to perform snapshot file swap {} -> {}",
+            p1.as_ref().display(),
+            p2.as_ref().display()
+        )
+    })?;
 
     Ok(())
 }
@@ -457,9 +518,9 @@ impl LogFileHeader {
         }
     }
 
-    fn sqld_version(&self) -> Version {
-        Version(self.sqld_version.map(Into::into))
-    }
+    // fn sqld_version(&self) -> Version {
+    //     Version(self.sqld_version.map(Into::into))
+    // }
 }
 
 #[derive(Debug)]
@@ -481,6 +542,7 @@ impl Generation {
 pub struct ReplicationLogger {
     pub generation: Generation,
     pub log_file: RwLock<LogFile>,
+    pub commit_timestamp_cache: moka::sync::Cache<FrameNo, DateTime<Utc>>,
     compactor: LogCompactor,
     db_path: PathBuf,
     /// a notifier channel other tasks can subscribe to, and get notified when new frames become
@@ -488,16 +550,19 @@ pub struct ReplicationLogger {
     pub new_frame_notifier: watch::Sender<Option<FrameNo>>,
     pub closed_signal: watch::Sender<bool>,
     pub auto_checkpoint: u32,
+    encryptor: Option<FrameEncryptor>,
 }
 
 impl ReplicationLogger {
-    pub fn open(
+    pub(crate) fn open(
         db_path: &Path,
         max_log_size: u64,
         max_log_duration: Option<Duration>,
         dirty: bool,
         auto_checkpoint: u32,
-        callback: SnapshotCallback,
+        scripted_backup: Option<ScriptBackupManager>,
+        namespace: NamespaceName,
+        encryption_config: Option<EncryptionConfig>,
     ) -> anyhow::Result<Self> {
         let log_path = db_path.join("wallog");
         let data_path = db_path.join("data");
@@ -511,7 +576,8 @@ impl ReplicationLogger {
             .open(log_path)?;
 
         let max_log_frame_count = max_log_size * 1_000_000 / LogFile::FRAME_SIZE as u64;
-        let log_file = LogFile::new(file, max_log_frame_count, max_log_duration)?;
+        let encryption = encryption_config.clone().map(FrameEncryptor::new);
+        let log_file = LogFile::new(file, max_log_frame_count, max_log_duration, encryption)?;
         let header = log_file.header();
 
         let should_recover = if dirty {
@@ -522,7 +588,9 @@ impl ReplicationLogger {
                 // there is no database; nothing to recover
                 false
             }
-        } else if header.version.get() < 2 || header.sqld_version() != Version::current() {
+        } else if header.version.get() < 2
+        /* || header.sqld_version() != Version::current() */
+        {
             tracing::info!("replication log version not compatible with current sqld version, recovering from database file.");
             true
         } else if fresh && data_path.exists() {
@@ -533,24 +601,48 @@ impl ReplicationLogger {
         };
 
         if should_recover {
-            Self::recover(log_file, data_path, callback, auto_checkpoint)
+            Self::recover(
+                log_file,
+                data_path,
+                auto_checkpoint,
+                scripted_backup,
+                namespace,
+                encryption_config,
+            )
         } else {
-            Self::from_log_file(db_path.to_path_buf(), log_file, callback, auto_checkpoint)
+            Self::from_log_file(
+                db_path.to_path_buf(),
+                log_file,
+                auto_checkpoint,
+                scripted_backup,
+                namespace,
+                encryption_config,
+            )
         }
     }
 
     fn from_log_file(
         db_path: PathBuf,
         log_file: LogFile,
-        callback: SnapshotCallback,
         auto_checkpoint: u32,
+        scripted_backup: Option<ScriptBackupManager>,
+        namespace: NamespaceName,
+        encryption_config: Option<EncryptionConfig>,
     ) -> anyhow::Result<Self> {
         let header = log_file.header();
         let generation_start_frame_no = header.last_frame_no();
 
         let (new_frame_notifier, _) = watch::channel(generation_start_frame_no);
         unsafe {
-            let conn = rusqlite::Connection::open(db_path.join("data"))?;
+            let conn = if cfg!(feature = "unix-excl-vfs") {
+                rusqlite::Connection::open_with_flags_and_vfs(
+                    db_path.join("data"),
+                    rusqlite::OpenFlags::default(),
+                    "unix-excl",
+                )
+            } else {
+                rusqlite::Connection::open(db_path.join("data"))
+            }?;
             let rc = rusqlite::ffi::sqlite3_wal_autocheckpoint(conn.handle(), auto_checkpoint as _);
             if rc != 0 {
                 bail!(
@@ -565,26 +657,33 @@ impl ReplicationLogger {
 
         let (closed_signal, _) = watch::channel(false);
 
+        let encryptor = encryption_config.map(FrameEncryptor::new);
         Ok(Self {
             generation: Generation::new(generation_start_frame_no.unwrap_or(0)),
             compactor: LogCompactor::new(
                 &db_path,
                 Uuid::from_u128(log_file.header.log_id.get()),
-                callback,
+                scripted_backup,
+                namespace,
             )?,
             log_file: RwLock::new(log_file),
             db_path,
             closed_signal,
             new_frame_notifier,
             auto_checkpoint,
+            // we keep the last 100 commit transaction timestamps
+            commit_timestamp_cache: moka::sync::Cache::new(*REPLICATION_LATENCY_CACHE_SIZE),
+            encryptor,
         })
     }
 
     fn recover(
         log_file: LogFile,
         mut data_path: PathBuf,
-        callback: SnapshotCallback,
         auto_checkpoint: u32,
+        scripted_backup: Option<ScriptBackupManager>,
+        namespace: NamespaceName,
+        encryption_config: Option<EncryptionConfig>,
     ) -> anyhow::Result<Self> {
         // It is necessary to checkpoint before we restore the replication log, since the WAL may
         // contain pages that are not in the database file.
@@ -593,6 +692,9 @@ impl ReplicationLogger {
         let snapshot_path = data_path.parent().unwrap().join("snapshots");
         // best effort, there may be no snapshots
         let _ = remove_dir_all(snapshot_path);
+        let to_compact_path = data_path.parent().unwrap().join("to_compact");
+        // best effort, there may nothing to compact
+        let _ = remove_dir_all(to_compact_path);
 
         let data_file = File::open(&data_path)?;
         let size = data_path.metadata()?.len();
@@ -603,6 +705,9 @@ impl ReplicationLogger {
         let num_page = size / LIBSQL_PAGE_SIZE;
         let mut buf = [0; LIBSQL_PAGE_SIZE as usize];
         let mut page_no = 1; // page numbering starts at 1
+                             // We take the encryption implementation out to restore undecrypted frames,
+                             // and later set it back in to create the replicator.
+        let encryptor = log_file.set_encryptor(None);
         for i in 0..num_page {
             data_file.read_exact_at(&mut buf, i * LIBSQL_PAGE_SIZE)?;
             log_file.push_page(&WalPage {
@@ -610,14 +715,23 @@ impl ReplicationLogger {
                 size_after: if i == num_page - 1 { num_page as _ } else { 0 },
                 data: Bytes::copy_from_slice(&buf),
             })?;
-            log_file.commit()?;
 
             page_no += 1;
         }
 
+        log_file.commit()?;
+        log_file.set_encryptor(encryptor);
+
         assert!(data_path.pop());
 
-        Self::from_log_file(data_path, log_file, callback, auto_checkpoint)
+        Self::from_log_file(
+            data_path,
+            log_file,
+            auto_checkpoint,
+            scripted_backup,
+            namespace,
+            encryption_config,
+        )
     }
 
     pub fn log_id(&self) -> Uuid {
@@ -656,11 +770,14 @@ impl ReplicationLogger {
     pub(crate) fn commit(&self) -> anyhow::Result<Option<FrameNo>> {
         let mut log_file = self.log_file.write();
         log_file.commit()?;
+        if let Some(frame_no) = log_file.header().last_frame_no() {
+            self.commit_timestamp_cache.insert(frame_no, Utc::now());
+        }
         Ok(log_file.header().last_frame_no())
     }
 
     pub async fn get_snapshot_file(&self, from: FrameNo) -> anyhow::Result<Option<SnapshotFile>> {
-        find_snapshot_file(&self.db_path, from).await
+        find_snapshot_file(&self.db_path, from, self.encryptor.clone()).await
     }
 
     pub fn get_frame(&self, frame_no: FrameNo) -> Result<Frame, LogReadError> {
@@ -718,7 +835,15 @@ pub fn checkpoint_db(data_path: &Path) -> anyhow::Result<()> {
     }
 
     unsafe {
-        let conn = rusqlite::Connection::open(data_path)?;
+        let conn = if cfg!(feature = "unix-excl-vfs") {
+            rusqlite::Connection::open_with_flags_and_vfs(
+                data_path,
+                rusqlite::OpenFlags::default(),
+                "unix-excl",
+            )
+        } else {
+            rusqlite::Connection::open(data_path)
+        }?;
         conn.query_row("PRAGMA journal_mode=WAL", (), |_| Ok(()))?;
         tracing::info!("initialized journal_mode=WAL");
         conn.pragma_query(None, "page_size", |row| {
@@ -754,11 +879,11 @@ pub fn checkpoint_db(data_path: &Path) -> anyhow::Result<()> {
 mod test {
     use std::collections::HashSet;
 
-    use libsql_sys::wal::Sqlite3WalManager;
+    use libsql_sys::wal::{Sqlite3WalManager, WalManager};
 
     use super::*;
-    use crate::connection::libsql::open_conn;
-    use crate::replication::primary::replication_logger_wal::ReplicationLoggerWalManager;
+    use crate::connection::legacy::open_conn;
+    use crate::replication::primary::replication_logger_wal::ReplicationLoggerWalWrapper;
     use crate::DEFAULT_AUTO_CHECKPOINT;
 
     #[tokio::test]
@@ -770,7 +895,9 @@ mod test {
             None,
             false,
             DEFAULT_AUTO_CHECKPOINT,
-            Box::new(|_| Ok(())),
+            None,
+            "test".into(),
+            None,
         )
         .unwrap();
 
@@ -806,7 +933,9 @@ mod test {
             None,
             false,
             DEFAULT_AUTO_CHECKPOINT,
-            Box::new(|_| Ok(())),
+            None,
+            "test".into(),
+            None,
         )
         .unwrap();
         let log_file = logger.log_file.write();
@@ -823,7 +952,9 @@ mod test {
             None,
             false,
             DEFAULT_AUTO_CHECKPOINT,
-            Box::new(|_| Ok(())),
+            None,
+            "test".into(),
+            None,
         )
         .unwrap();
         let entry = WalPage {
@@ -839,7 +970,7 @@ mod test {
     #[test]
     fn log_file_test_rollback() {
         let f = tempfile::tempfile().unwrap();
-        let mut log_file = LogFile::new(f, 100, None).unwrap();
+        let mut log_file = LogFile::new(f, 100, None, None).unwrap();
         (0..5)
             .map(|i| WalPage {
                 page_no: i,
@@ -881,6 +1012,59 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(feature = "encryption")]
+    async fn log_with_encryption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logger = ReplicationLogger::open(
+            tmp.path(),
+            100000000,
+            None,
+            false,
+            100000,
+            None,
+            "test".into(),
+            None,
+        )
+        .unwrap();
+
+        let frames = (0..10)
+            .map(|i| WalPage {
+                page_no: i,
+                size_after: 0,
+                data: Bytes::from(vec![i as _; 4096]),
+            })
+            .collect::<Vec<_>>();
+        logger.write_pages(&frames).unwrap();
+        logger.commit().unwrap();
+
+        let log_file = logger.log_file.write();
+        for i in 0..10 {
+            let frame = log_file.frame(i).unwrap();
+            assert_eq!(frame.header().page_no.get(), i as u32);
+            assert!(frame.page().iter().all(|x| i as u8 == *x));
+        }
+
+        assert_eq!(
+            log_file.header.start_frame_no.get() + log_file.header.frame_count.get(),
+            10
+        );
+
+        // The file contents do not contain raw data when read directly - it's encrypted
+        let file = File::open(tmp.path().join("wallog")).unwrap();
+        for i in 0..10 {
+            let mut buf = [0; 4096];
+            file.read_exact_at(&mut buf, i * 4096).unwrap();
+            assert!(!buf.iter().all(|x| i as u8 == *x));
+        }
+        // When we read via the log file API though, we get the decrypted data
+        for i in 0..10 {
+            let frame = log_file.frame(i).unwrap();
+            assert_eq!(frame.header().page_no.get(), i as u32);
+            assert!(frame.page().iter().all(|x| i as u8 == *x));
+        }
+    }
+
+    #[tokio::test]
     async fn savepoint_and_rollback() {
         let tmp = tempfile::tempdir().unwrap();
         let logger = Arc::new(
@@ -890,12 +1074,19 @@ mod test {
                 None,
                 false,
                 100000,
-                Box::new(|_| Ok(())),
+                None,
+                "test".into(),
+                None,
             )
             .unwrap(),
         );
-        let mut conn =
-            open_conn(tmp.path(), ReplicationLoggerWalManager::new(logger), None).unwrap();
+        let mut conn = open_conn(
+            tmp.path(),
+            Sqlite3WalManager::default().wrap(ReplicationLoggerWalWrapper::new(logger)),
+            None,
+            None,
+        )
+        .unwrap();
         conn.execute("BEGIN", ()).unwrap();
 
         conn.execute("CREATE TABLE test (x)", ()).unwrap();
@@ -903,7 +1094,7 @@ mod test {
         // try to write a few pages
         for i in 0..10000 {
             savepoint
-                .execute(&format!("INSERT INTO test values (\"foobar{i}\")"), ())
+                .execute(&format!("INSERT INTO test values ('foobar{i}')"), ())
                 .unwrap();
             // force a flush
             savepoint.cache_flush().unwrap();
@@ -919,7 +1110,7 @@ mod test {
         // now we restore from the log and make sure the two db are consistent.
         let tmp2 = tempfile::tempdir().unwrap();
         let f = File::open(tmp.path().join("wallog")).unwrap();
-        let logfile = LogFile::new(f, 1000000000, None).unwrap();
+        let logfile = LogFile::new(f, 1000000000, None, None).unwrap();
         let mut seen = HashSet::new();
         let mut new_db_file = File::create(tmp2.path().join("data")).unwrap();
         for frame in logfile.rev_frames_iter_mut().unwrap() {
@@ -935,7 +1126,7 @@ mod test {
 
         new_db_file.flush().unwrap();
 
-        let conn2 = open_conn(tmp2.path(), Sqlite3WalManager::new(), None).unwrap();
+        let conn2 = open_conn(tmp2.path(), Sqlite3WalManager::new(), None, None).unwrap();
 
         conn2
             .query_row("SELECT count(*) FROM test", (), |row| {

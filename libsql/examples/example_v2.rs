@@ -1,4 +1,4 @@
-use libsql::Database;
+use libsql::Builder;
 
 #[tokio::main]
 async fn main() {
@@ -8,9 +8,9 @@ async fn main() {
             "".to_string()
         });
 
-        Database::open_remote(url, token).unwrap()
+        Builder::new_remote(url, token).build().await.unwrap()
     } else {
-        Database::open_in_memory().unwrap()
+        Builder::new_local(":memory:").build().await.unwrap()
     };
 
     let conn = db.connect().unwrap();
@@ -35,7 +35,7 @@ async fn main() {
 
     let mut rows = stmt.query(["foo@example.com"]).await.unwrap();
 
-    let row = rows.next().unwrap().unwrap();
+    let row = rows.next().await.unwrap().unwrap();
 
     let value = row.get_value(0).unwrap();
 

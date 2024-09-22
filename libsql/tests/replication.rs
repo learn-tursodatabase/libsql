@@ -1,4 +1,6 @@
-use libsql::{Database, Frames};
+#![allow(deprecated)]
+
+use libsql::{replication::Frames, Database};
 use libsql_replication::{
     frame::{FrameBorrowed, FrameHeader, FrameMut},
     LIBSQL_PAGE_SIZE,
@@ -9,7 +11,7 @@ const DB: &[u8] = include_bytes!("test.db");
 #[tokio::test]
 async fn inject_frames() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Database::open_with_local_sync(tmp.path().join("data").to_str().unwrap())
+    let db = Database::open_with_local_sync(tmp.path().join("data").to_str().unwrap(), None)
         .await
         .unwrap();
 
@@ -32,10 +34,7 @@ async fn inject_frames() {
     let frames = frames.into_iter().map(Into::into).collect();
 
     assert_eq!(
-        db.sync_frames(libsql::Frames::Vec(frames))
-            .await
-            .unwrap()
-            .unwrap(),
+        db.sync_frames(Frames::Vec(frames)).await.unwrap().unwrap(),
         2
     );
 
@@ -44,6 +43,7 @@ async fn inject_frames() {
     assert_eq!(
         *rows
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)
@@ -73,7 +73,7 @@ async fn inject_frames() {
     let frames = frames.into_iter().map(Into::into).collect();
 
     assert_eq!(
-        db.sync_frames(libsql::Frames::Vec(frames))
+        db.sync_frames(libsql::replication::Frames::Vec(frames))
             .await
             .unwrap()
             .unwrap(),
@@ -85,6 +85,7 @@ async fn inject_frames() {
     assert_eq!(
         *rows
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)
@@ -98,7 +99,7 @@ async fn inject_frames() {
 #[tokio::test]
 async fn inject_frames_split_txn() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Database::open_with_local_sync(tmp.path().join("data").to_str().unwrap())
+    let db = Database::open_with_local_sync(tmp.path().join("data").to_str().unwrap(), None)
         .await
         .unwrap();
 
@@ -151,6 +152,7 @@ async fn inject_frames_split_txn() {
     assert_eq!(
         *rows
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)

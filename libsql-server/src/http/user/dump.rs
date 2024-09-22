@@ -2,15 +2,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task;
 
-use axum::extract::State as AxumState;
+use axum::extract::{Query, State as AxumState};
 use futures::StreamExt;
 use hyper::HeaderMap;
 use pin_project_lite::pin_project;
+use serde::Deserialize;
 
 use crate::auth::Authenticated;
 use crate::connection::dump::exporter::export_dump;
+use crate::connection::Connection as _;
 use crate::error::Error;
-use crate::namespace::MakeNamespace;
 use crate::BLOCKING_RT;
 
 use super::db_factory::namespace_from_headers;
@@ -72,10 +73,16 @@ where
     }
 }
 
-pub(super) async fn handle_dump<F: MakeNamespace>(
+#[derive(Deserialize)]
+pub struct DumpQuery {
+    preserve_row_ids: Option<bool>,
+}
+
+pub(super) async fn handle_dump(
     auth: Authenticated,
-    AxumState(state): AxumState<AppState<F>>,
+    AxumState(state): AxumState<AppState>,
     headers: HeaderMap,
+    query: Query<DumpQuery>,
 ) -> crate::Result<axum::body::StreamBody<impl futures::Stream<Item = Result<bytes::Bytes, Error>>>>
 {
     let namespace = namespace_from_headers(
@@ -84,19 +91,28 @@ pub(super) async fn handle_dump<F: MakeNamespace>(
         state.disable_namespaces,
     )?;
 
-    if !auth.is_namespace_authorized(&namespace) | auth.is_anonymous() {
+    if !auth.is_namespace_authorized(&namespace) {
         return Err(Error::NamespaceDoesntExist(namespace.to_string()));
     }
 
-    let db_path = state.path.join("dbs").join(namespace.as_str()).join("data");
+    let conn_maker = state
+        .namespaces
+        .with(namespace, |ns| {
+            assert!(ns.db.is_primary());
+            ns.db.connection_maker()
+        })
+        .await
+        .unwrap();
 
-    let connection = rusqlite::Connection::open(db_path)?;
+    let conn = conn_maker.create().await.unwrap();
 
     let (reader, writer) = tokio::io::duplex(8 * 1024);
 
     let join_handle = BLOCKING_RT.spawn_blocking(move || {
         let writer = tokio_util::io::SyncIoBridge::new(writer);
-        export_dump(connection, writer).map_err(Into::into)
+        conn.with_raw(|conn| {
+            export_dump(conn, writer, query.preserve_row_ids.unwrap_or(false)).map_err(Into::into)
+        })
     });
 
     let stream = tokio_util::io::ReaderStream::new(reader);

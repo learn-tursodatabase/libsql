@@ -1,7 +1,11 @@
+#![allow(deprecated)]
+
 mod dumps;
 mod meta;
+mod shared_schema;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::common::http::Client;
 use crate::common::net::{init_tracing, SimServer, TestServer, TurmoilAcceptor, TurmoilConnector};
@@ -25,6 +29,7 @@ fn make_primary(sim: &mut Sim, path: PathBuf) {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
                     connector: TurmoilConnector,
                     disable_metrics: true,
+                    auth_key: None,
                 }),
                 rpc_server_config: Some(RpcServerConfig {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
@@ -44,7 +49,9 @@ fn make_primary(sim: &mut Sim, path: PathBuf) {
 
 #[test]
 fn fork_namespace() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
     make_primary(&mut sim, tmp.path().to_path_buf());
 
@@ -72,7 +79,7 @@ fn fork_namespace() {
         // what's in foo is in bar as well
         let mut rows = bar_conn.query("select count(*) from test", ()).await?;
         assert!(matches!(
-            rows.next().unwrap().unwrap().get_value(0).unwrap(),
+            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
             Value::Integer(1)
         ));
 
@@ -81,14 +88,14 @@ fn fork_namespace() {
         // add something to bar
         let mut rows = bar_conn.query("select count(*) from test", ()).await?;
         assert!(matches!(
-            rows.next().unwrap().unwrap().get_value(0)?,
+            rows.next().await.unwrap().unwrap().get_value(0)?,
             Value::Integer(2)
         ));
 
         // ... and make sure it doesn't exist in foo
         let mut rows = foo_conn.query("select count(*) from test", ()).await?;
         assert!(matches!(
-            rows.next().unwrap().unwrap().get_value(0)?,
+            rows.next().await.unwrap().unwrap().get_value(0)?,
             Value::Integer(1)
         ));
 
@@ -100,7 +107,9 @@ fn fork_namespace() {
 
 #[test]
 fn delete_namespace() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
     make_primary(&mut sim, tmp.path().to_path_buf());
 
@@ -116,11 +125,12 @@ fn delete_namespace() {
         foo_conn.execute("create table test (c)", ()).await?;
 
         client
-            .post("http://primary:9090/v1/namespaces/foo/destroy", json!({}))
+            .delete("http://primary:9090/v1/namespaces/foo", json!({}))
             .await
             .unwrap();
         // namespace doesn't exist anymore
-        assert!(foo_conn.execute("create table test (c)", ()).await.is_err());
+        let res = foo_conn.execute("create table test (c)", ()).await;
+        assert!(res.is_err());
 
         Ok(())
     });

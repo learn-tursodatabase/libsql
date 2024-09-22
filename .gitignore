@@ -4,7 +4,12 @@
 *.sqld
 
 libsql-server/testrollbackrestore/**
+libsql-server/testbackuprestore/**
 libsql-sqlite3/**.o.tmp
+/libsql-ffi/bundled/SQLite3MultipleCiphers/build/**
+# will be copied from bundled/src
+/libsql-ffi/bundled/SQLite3MultipleCiphers/src/sqlite3.c
 
-/Cargo.lock
-
+/bindings/c/generated
+/bindings/c/**.xcframework
+/bindings/**/.DS_Store

@@ -2,9 +2,9 @@ use anyhow::{anyhow, bail, Result};
 use bytesize::ByteSize;
 
 use super::super::{batch, stmt, ProtocolError, Version};
-use super::{proto, stream};
-use crate::auth::Authenticated;
-use crate::connection::Connection;
+use super::stream;
+use crate::connection::{Connection, RequestContext};
+use libsql_hrana::proto;
 
 const MAX_SQL_COUNT: usize = 50;
 const MAX_STORED_SQL_SIZE: ByteSize = ByteSize::kb(5);
@@ -22,13 +22,13 @@ enum StreamResponseError {
     Batch(batch::BatchError),
 }
 
-pub async fn handle<D: Connection>(
-    stream_guard: &mut stream::Guard<'_, D>,
-    auth: Authenticated,
+pub async fn handle(
+    stream_guard: &mut stream::Guard<'_>,
+    ctx: RequestContext,
     request: proto::StreamRequest,
     version: Version,
 ) -> Result<proto::StreamResult> {
-    let result = match try_handle(stream_guard, auth, request, version).await {
+    let result = match try_handle(stream_guard, ctx, request, version).await {
         Ok(response) => proto::StreamResult::Ok { response },
         Err(err) => {
             let resp_err = err.downcast::<StreamResponseError>()?;
@@ -42,9 +42,9 @@ pub async fn handle<D: Connection>(
     Ok(result)
 }
 
-async fn try_handle<D: Connection>(
-    stream_guard: &mut stream::Guard<'_, D>,
-    auth: Authenticated,
+async fn try_handle(
+    stream_guard: &mut stream::Guard<'_>,
+    ctx: RequestContext,
     request: proto::StreamRequest,
     version: Version,
 ) -> Result<proto::StreamResponse> {
@@ -70,7 +70,7 @@ async fn try_handle<D: Connection>(
             let sqls = stream_guard.sqls();
             let query =
                 stmt::proto_stmt_to_query(&req.stmt, sqls, version).map_err(catch_stmt_error)?;
-            let result = stmt::execute_stmt(db, auth, query, req.stmt.replication_index)
+            let result = stmt::execute_stmt(db, ctx, query, req.stmt.replication_index)
                 .await
                 .map_err(catch_stmt_error)?;
             proto::StreamResponse::Execute(proto::ExecuteStreamResp { result })
@@ -81,7 +81,7 @@ async fn try_handle<D: Connection>(
             let pgm = batch::proto_batch_to_program(&req.batch, sqls, version)
                 .map_err(catch_stmt_error)
                 .map_err(catch_batch_error)?;
-            let result = batch::execute_batch(db, auth, pgm, req.batch.replication_index)
+            let result = batch::execute_batch(db, ctx, pgm, req.batch.replication_index)
                 .await
                 .map_err(catch_batch_error)?;
             proto::StreamResponse::Batch(proto::BatchStreamResp { result })
@@ -91,7 +91,7 @@ async fn try_handle<D: Connection>(
             let sqls = stream_guard.sqls();
             let sql = stmt::proto_sql_to_sql(req.sql.as_deref(), req.sql_id, sqls, version)?;
             let pgm = batch::proto_sequence_to_program(sql).map_err(catch_stmt_error)?;
-            batch::execute_sequence(db, auth, pgm, req.replication_index)
+            batch::execute_sequence(db, ctx, pgm, req.replication_index)
                 .await
                 .map_err(catch_stmt_error)
                 .map_err(catch_batch_error)?;
@@ -101,7 +101,7 @@ async fn try_handle<D: Connection>(
             let db = stream_guard.get_db()?;
             let sqls = stream_guard.sqls();
             let sql = stmt::proto_sql_to_sql(req.sql.as_deref(), req.sql_id, sqls, version)?;
-            let result = stmt::describe_stmt(db, auth, sql.into(), req.replication_index)
+            let result = stmt::describe_stmt(db, ctx, sql.into(), req.replication_index)
                 .await
                 .map_err(catch_stmt_error)?;
             proto::StreamResponse::Describe(proto::DescribeStreamResp { result })
@@ -138,14 +138,34 @@ async fn try_handle<D: Connection>(
 fn catch_stmt_error(err: anyhow::Error) -> anyhow::Error {
     match err.downcast::<stmt::StmtError>() {
         Ok(stmt_err) => anyhow!(StreamResponseError::Stmt(stmt_err)),
-        Err(err) => err,
+        Err(err) => match err.downcast::<crate::Error>() {
+            Ok(crate::Error::Migration(e)) => {
+                anyhow!(StreamResponseError::Stmt(stmt::StmtError::SqliteError {
+                    source: rusqlite::ffi::Error {
+                        code: rusqlite::ffi::ErrorCode::Unknown,
+                        extended_code: 4242
+                    },
+                    message: e.to_string()
+                }))
+            }
+            Ok(err) => anyhow!(err),
+            Err(err) => err,
+        },
     }
 }
 
 fn catch_batch_error(err: anyhow::Error) -> anyhow::Error {
     match err.downcast::<batch::BatchError>() {
         Ok(batch_err) => anyhow!(StreamResponseError::Batch(batch_err)),
-        Err(err) => err,
+        Err(err) => match err.downcast::<crate::Error>() {
+            Ok(crate::Error::Migration(e)) => {
+                anyhow!(StreamResponseError::Batch(batch::BatchError::SchemaError {
+                    message: e.to_string()
+                }))
+            }
+            Ok(err) => anyhow!(err),
+            Err(err) => err,
+        },
     }
 }
 

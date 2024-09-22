@@ -18,7 +18,9 @@ use crate::common::{
 /// operation.
 #[test]
 fn replica_restart() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
     sim.host("primary", move || {
         let path = tmp.path().to_path_buf();
@@ -32,6 +34,7 @@ fn replica_restart() {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
                     connector: TurmoilConnector,
                     disable_metrics: true,
+                    auth_key: None,
                 }),
                 rpc_server_config: Some(RpcServerConfig {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
@@ -65,6 +68,7 @@ fn replica_restart() {
                             acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                             connector: TurmoilConnector,
                             disable_metrics: true,
+                            auth_key: None,
                         }),
                         rpc_client_config: Some(RpcClientConfig {
                             remote_url: "http://primary:4567".into(),
@@ -162,7 +166,9 @@ fn replica_restart() {
 /// self heal. During this process the replica is not shutdown.
 #[test]
 fn primary_regenerate_log_no_replica_restart() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
 
     let notify = Arc::new(Notify::new());
@@ -183,6 +189,7 @@ fn primary_regenerate_log_no_replica_restart() {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                         connector: TurmoilConnector,
                         disable_metrics: true,
+                        auth_key: None,
                     }),
                     rpc_server_config: Some(RpcServerConfig {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await.unwrap(),
@@ -237,6 +244,7 @@ fn primary_regenerate_log_no_replica_restart() {
                             acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                             connector: TurmoilConnector,
                             disable_metrics: true,
+                            auth_key: None,
                         }),
                         rpc_client_config: Some(RpcClientConfig {
                             remote_url: "http://primary:4567".into(),
@@ -338,7 +346,9 @@ fn primary_regenerate_log_no_replica_restart() {
 /// and it should self heal.
 #[test]
 fn primary_regenerate_log_with_replica_restart() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
 
     let notify = Arc::new(Notify::new());
@@ -359,6 +369,7 @@ fn primary_regenerate_log_with_replica_restart() {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                         connector: TurmoilConnector,
                         disable_metrics: true,
+                        auth_key: None,
                     }),
                     rpc_server_config: Some(RpcServerConfig {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await.unwrap(),
@@ -415,6 +426,7 @@ fn primary_regenerate_log_with_replica_restart() {
                             acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                             connector: TurmoilConnector,
                             disable_metrics: true,
+                            auth_key: None,
                         }),
                         rpc_client_config: Some(RpcClientConfig {
                             remote_url: "http://primary:4567".into(),

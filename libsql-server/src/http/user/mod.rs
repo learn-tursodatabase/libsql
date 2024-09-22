@@ -1,50 +1,57 @@
 pub mod db_factory;
 mod dump;
+mod extract;
 mod hrana_over_http_1;
+mod listen;
 mod result_builder;
 mod trace;
 mod types;
+#[macro_use]
+pub mod timing;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::extract::{FromRef, FromRequest, FromRequestParts, State as AxumState};
+use axum::extract::{FromRef, FromRequest, FromRequestParts, Path as AxumPath, State as AxumState};
 use axum::http::request::Parts;
 use axum::http::HeaderValue;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{middleware, Router};
 use axum_extra::middleware::option_layer;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
 use base64::Engine;
 use hyper::{header, Body, Request, Response, StatusCode};
+use libsql_replication::rpc::replication::replication_log_server::{
+    ReplicationLog, ReplicationLogServer,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Number;
-use tokio::sync::{mpsc, oneshot, Notify};
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Server;
 
+use tower_http::compression::predicate::NotForContentType;
+use tower_http::compression::{DefaultPredicate, Predicate};
 use tower_http::{compression::CompressionLayer, cors};
 
-use crate::auth::{Auth, Authenticated};
-use crate::connection::Connection;
-use crate::database::Database;
+use crate::auth::{Auth, AuthError, Authenticated, Jwt, Permission, UserAuthContext};
+use crate::connection::{Connection, RequestContext};
 use crate::error::Error;
-use crate::hrana;
+use crate::http::user::db_factory::MakeConnectionExtractorPath;
+use crate::http::user::timing::timings_middleware;
 use crate::http::user::types::HttpQuery;
 use crate::metrics::LEGACY_HTTP_CALL;
-use crate::namespace::{MakeNamespace, NamespaceStore};
+use crate::namespace::NamespaceStore;
 use crate::net::Accept;
 use crate::query::{self, Query};
 use crate::query_analysis::{predict_final_state, Statement, TxnStatus};
 use crate::query_result_builder::QueryResultBuilder;
 use crate::rpc::proxy::rpc::proxy_server::{Proxy, ProxyServer};
-use crate::rpc::replication_log::rpc::replication_log_server::ReplicationLog;
-use crate::rpc::ReplicationLogServer;
+use crate::schema::{MigrationDetails, MigrationSummary};
 use crate::utils::services::idle_shutdown::IdleShutdownKicker;
 use crate::version;
+use crate::{hrana, TaskManager};
 
 use self::db_factory::MakeConnectionExtractor;
 use self::result_builder::JsonHttpPayloadBuilder;
@@ -76,6 +83,7 @@ impl TryFrom<query::Value> for serde_json::Value {
 
 /// Encodes a query response rows into json
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct RowsResponse {
     columns: Vec<String>,
     rows: Vec<Vec<serde_json::Value>>,
@@ -123,9 +131,9 @@ fn parse_queries(queries: Vec<QueryObject>) -> crate::Result<Vec<Query>> {
     Ok(out)
 }
 
-async fn handle_query<C: Connection>(
-    auth: Authenticated,
-    MakeConnectionExtractor(connection_maker): MakeConnectionExtractor<C>,
+async fn handle_query(
+    ctx: RequestContext,
+    MakeConnectionExtractor(connection_maker): MakeConnectionExtractor,
     Json(query): Json<HttpQuery>,
 ) -> Result<axum::response::Response, Error> {
     LEGACY_HTTP_CALL.increment(1);
@@ -135,7 +143,7 @@ async fn handle_query<C: Connection>(
 
     let builder = JsonHttpPayloadBuilder::new();
     let builder = db
-        .execute_batch_or_rollback(batch, auth, builder, query.replication_index)
+        .execute_batch_or_rollback(batch, ctx, builder, query.replication_index)
         .await?;
 
     let res = (
@@ -145,8 +153,8 @@ async fn handle_query<C: Connection>(
     Ok(res.into_response())
 }
 
-async fn show_console<F: MakeNamespace>(
-    AxumState(AppState { enable_console, .. }): AxumState<AppState<F>>,
+async fn show_console(
+    AxumState(AppState { enable_console, .. }): AxumState<AppState>,
 ) -> impl IntoResponse {
     if enable_console {
         Html(std::include_str!("console.html")).into_response()
@@ -160,8 +168,8 @@ async fn handle_health() -> Response<Body> {
     Response::new(Body::empty())
 }
 
-async fn handle_upgrade<F: MakeNamespace>(
-    AxumState(AppState { upgrade_tx, .. }): AxumState<AppState<F>>,
+async fn handle_upgrade(
+    AxumState(AppState { upgrade_tx, .. }): AxumState<AppState>,
     req: Request<Body>,
 ) -> impl IntoResponse {
     if !hyper_tungstenite::is_upgrade_request(&req) {
@@ -195,39 +203,50 @@ async fn handle_fallback() -> impl IntoResponse {
     (StatusCode::NOT_FOUND).into_response()
 }
 
+async fn handle_hrana_pipeline(
+    AxumState(state): AxumState<AppState>,
+    MakeConnectionExtractorPath(connection_maker): MakeConnectionExtractorPath,
+    ctx: RequestContext,
+    axum::extract::Path((_, version)): axum::extract::Path<(String, String)>,
+    req: Request<Body>,
+) -> Result<Response<Body>, Error> {
+    let hrana_version = match version.as_str() {
+        "2" => hrana::Version::Hrana2,
+        "3" => hrana::Version::Hrana3,
+        _ => return Err(Error::InvalidPath("invalid hrana version".to_string())),
+    };
+    Ok(state
+        .hrana_http_srv
+        .handle_request(
+            connection_maker,
+            ctx,
+            req,
+            hrana::http::Endpoint::Pipeline,
+            hrana_version,
+            hrana::Encoding::Json,
+        )
+        .await?)
+}
+
 /// Router wide state that each request has access too via
 /// axum's `State` extractor.
-pub(crate) struct AppState<F: MakeNamespace> {
-    auth: Arc<Auth>,
-    namespaces: NamespaceStore<F>,
+#[derive(Clone)]
+pub(crate) struct AppState {
+    user_auth_strategy: Auth,
+    namespaces: NamespaceStore,
     upgrade_tx: mpsc::Sender<hrana::ws::Upgrade>,
-    hrana_http_srv: Arc<hrana::http::Server<<F::Database as Database>::Connection>>,
+    hrana_http_srv: Arc<hrana::http::Server>,
     enable_console: bool,
     disable_default_namespace: bool,
     disable_namespaces: bool,
-    path: Arc<Path>,
+    primary_url: Option<String>,
 }
 
-impl<F: MakeNamespace> Clone for AppState<F> {
-    fn clone(&self) -> Self {
-        Self {
-            auth: self.auth.clone(),
-            namespaces: self.namespaces.clone(),
-            upgrade_tx: self.upgrade_tx.clone(),
-            hrana_http_srv: self.hrana_http_srv.clone(),
-            enable_console: self.enable_console,
-            disable_default_namespace: self.disable_default_namespace,
-            disable_namespaces: self.disable_namespaces,
-            path: self.path.clone(),
-        }
-    }
-}
-
-pub struct UserApi<M: MakeNamespace, A, P, S> {
-    pub auth: Arc<Auth>,
+pub struct UserApi<A, P, S> {
+    pub user_auth_strategy: Auth,
     pub http_acceptor: Option<A>,
     pub hrana_ws_acceptor: Option<A>,
-    pub namespaces: NamespaceStore<M>,
+    pub namespaces: NamespaceStore,
     pub idle_shutdown_kicker: Option<IdleShutdownKicker>,
     pub proxy_service: P,
     pub replication_service: S,
@@ -236,28 +255,23 @@ pub struct UserApi<M: MakeNamespace, A, P, S> {
     pub max_response_size: u64,
     pub enable_console: bool,
     pub self_url: Option<String>,
-    pub path: Arc<Path>,
-    pub shutdown: Arc<Notify>,
+    pub primary_url: Option<String>,
 }
 
-impl<M, A, P, S> UserApi<M, A, P, S>
+impl<A, P, S> UserApi<A, P, S>
 where
-    M: MakeNamespace,
     A: Accept,
     P: Proxy,
     S: ReplicationLog,
 {
-    pub fn configure(
-        self,
-        join_set: &mut JoinSet<anyhow::Result<()>>,
-    ) -> Arc<hrana::http::Server<<<M as MakeNamespace>::Database as Database>::Connection>> {
+    pub fn configure(self, task_manager: &mut TaskManager) -> Arc<hrana::http::Server> {
         let (hrana_accept_tx, hrana_accept_rx) = mpsc::channel(8);
         let (hrana_upgrade_tx, hrana_upgrade_rx) = mpsc::channel(8);
         let hrana_http_srv = Arc::new(hrana::http::Server::new(self.self_url.clone()));
 
-        join_set.spawn({
+        task_manager.spawn_until_shutdown({
             let namespaces = self.namespaces.clone();
-            let auth = self.auth.clone();
+            let user_auth_strategy = self.user_auth_strategy.clone();
             let idle_kicker = self
                 .idle_shutdown_kicker
                 .clone()
@@ -267,7 +281,7 @@ where
             let max_response_size = self.max_response_size;
             async move {
                 hrana::ws::serve(
-                    auth,
+                    user_auth_strategy,
                     idle_kicker,
                     max_response_size,
                     hrana_accept_rx,
@@ -281,7 +295,7 @@ where
             }
         });
 
-        join_set.spawn({
+        task_manager.spawn_until_shutdown({
             let server = hrana_http_srv.clone();
             async move {
                 server.run_expire().await;
@@ -290,7 +304,7 @@ where
         });
 
         if let Some(acceptor) = self.hrana_ws_acceptor {
-            join_set.spawn(async move {
+            task_manager.spawn_until_shutdown(async move {
                 hrana::ws::listen(acceptor, hrana_accept_tx).await;
                 Ok(())
             });
@@ -298,31 +312,29 @@ where
 
         if let Some(acceptor) = self.http_acceptor {
             let state = AppState {
-                auth: self.auth,
+                user_auth_strategy: self.user_auth_strategy,
                 upgrade_tx: hrana_upgrade_tx,
                 hrana_http_srv: hrana_http_srv.clone(),
                 enable_console: self.enable_console,
                 namespaces: self.namespaces,
                 disable_default_namespace: self.disable_default_namespace,
                 disable_namespaces: self.disable_namespaces,
-                path: self.path,
+                primary_url: self.primary_url.clone(),
             };
 
             macro_rules! handle_hrana {
                 ($endpoint:expr, $version:expr, $encoding:expr,) => {{
-                    async fn handle_hrana<F: MakeNamespace>(
-                        AxumState(state): AxumState<AppState<F>>,
-                        MakeConnectionExtractor(connection_maker): MakeConnectionExtractor<
-                            <F::Database as Database>::Connection,
-                        >,
-                        auth: Authenticated,
+                    async fn handle_hrana(
+                        AxumState(state): AxumState<AppState>,
+                        MakeConnectionExtractor(connection_maker): MakeConnectionExtractor,
+                        ctx: RequestContext,
                         req: Request<Body>,
                     ) -> Result<Response<Body>, Error> {
                         Ok(state
                             .hrana_http_srv
                             .handle_request(
                                 connection_maker,
-                                auth,
+                                ctx,
                                 req,
                                 $endpoint,
                                 $version,
@@ -341,6 +353,7 @@ where
                 .route("/console", get(show_console))
                 .route("/health", get(handle_health))
                 .route("/dump", get(dump::handle_dump))
+                .route("/beta/listen", get(listen::handle_listen))
                 .route("/v1", get(hrana_over_http_1::handle_index))
                 .route("/v1/execute", post(hrana_over_http_1::handle_execute))
                 .route("/v1/batch", post(hrana_over_http_1::handle_batch))
@@ -387,6 +400,14 @@ where
                         hrana::Encoding::Protobuf,
                     )),
                 )
+                // turso dev routes
+                .route(
+                    "/dev/:namespace/v:version/pipeline",
+                    post(handle_hrana_pipeline),
+                )
+                .route("/v1/jobs", get(handle_get_migrations))
+                .route("/v1/jobs/:job_id", get(handle_get_migration_details))
+                .layer(middleware::from_fn(timings_middleware))
                 .with_state(state);
 
             // Merge the grpc based axum router into our regular http router
@@ -410,7 +431,10 @@ where
                         .on_response(trace::response)
                         .on_failure(trace::failure),
                 )
-                .layer(CompressionLayer::new())
+                .layer(CompressionLayer::new().compress_when(
+                    // TODO: remove this when we upgrade tower-http to 0.5.3
+                    DefaultPredicate::new().and(NotForContentType::new("text/event-stream")),
+                ))
                 .layer(
                     cors::CorsLayer::new()
                         .allow_methods(cors::AllowMethods::any())
@@ -421,10 +445,10 @@ where
             let router = router.fallback(handle_fallback);
             let h2c = crate::h2c::H2cMaker::new(router);
 
-            join_set.spawn(async move {
+            task_manager.spawn_with_shutdown_notify(|shutdown| async move {
                 hyper::server::Server::builder(acceptor)
                     .serve(h2c)
-                    .with_graceful_shutdown(self.shutdown.notified())
+                    .with_graceful_shutdown(shutdown.notified())
                     .await
                     .context("http server")?;
                 Ok(())
@@ -436,28 +460,59 @@ where
 
 /// Axum authenticated extractor
 #[tonic::async_trait]
-impl<M> FromRequestParts<AppState<M>> for Authenticated
-where
-    M: MakeNamespace,
-{
+impl FromRequestParts<AppState> for Authenticated {
     type Rejection = Error;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState<M>,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let auth_header = parts.headers.get(hyper::header::AUTHORIZATION);
-        let auth = state
-            .auth
-            .authenticate_http(auth_header, state.disable_namespaces)?;
+        let ns = db_factory::namespace_from_headers(
+            &parts.headers,
+            state.disable_default_namespace,
+            state.disable_namespaces,
+        )?;
+        // todo dupe #auth
+        let namespace_jwt_keys = state
+            .namespaces
+            .with(ns.clone(), |ns| ns.jwt_keys())
+            .await??;
 
-        Ok(auth)
+        let auth = namespace_jwt_keys
+            .map(Jwt::new)
+            .map(Auth::new)
+            .unwrap_or_else(|| state.user_auth_strategy.clone());
+
+        let context = build_context(&parts.headers, &auth.user_strategy.required_fields());
+
+        Ok(auth.authenticate(context)?)
     }
 }
 
-impl<F: MakeNamespace> FromRef<AppState<F>> for Arc<Auth> {
-    fn from_ref(input: &AppState<F>) -> Self {
-        input.auth.clone()
+fn build_context(
+    headers: &hyper::HeaderMap<HeaderValue>,
+    required_fields: &Vec<&'static str>,
+) -> UserAuthContext {
+    let mut ctx = headers
+        .get(hyper::header::AUTHORIZATION)
+        .ok_or(AuthError::AuthHeaderNotFound)
+        .and_then(|h| h.to_str().map_err(|_| AuthError::AuthHeaderNonAscii))
+        .and_then(|t| UserAuthContext::from_auth_str(t))
+        .unwrap_or(UserAuthContext::empty());
+
+    for field in required_fields.iter() {
+        headers
+            .get(field.to_string())
+            .map(|h| h.to_str().ok())
+            .and_then(|t| t.map(|s| ctx.add_field(field, s.into())));
+    }
+
+    ctx
+}
+
+impl FromRef<AppState> for Auth {
+    fn from_ref(input: &AppState) -> Self {
+        input.user_auth_strategy.clone()
     }
 }
 
@@ -487,5 +542,60 @@ where
         axum::Json::from_request(req, state)
             .await
             .map(|t| Json(t.0))
+    }
+}
+
+async fn handle_get_migrations(
+    AxumState(app_state): AxumState<AppState>,
+    ctx: RequestContext,
+) -> crate::Result<axum::Json<MigrationSummary>> {
+    ctx.auth().has_right(ctx.namespace(), Permission::Read)?;
+    {
+        // validate if this is a valid target for the request
+        let store = app_state
+            .namespaces
+            .config_store(ctx.namespace().clone())
+            .await?;
+        let config = (*store.get()).clone();
+        if !config.is_shared_schema {
+            tracing::warn!("invalid namespace: target is not a shared schema");
+            return Err(Error::InvalidNamespace);
+        }
+    }
+
+    let meta_store = app_state.namespaces.meta_store();
+    let summary = meta_store
+        .get_migrations_summary(ctx.namespace().clone())
+        .await?;
+
+    Ok(axum::Json(summary))
+}
+
+async fn handle_get_migration_details(
+    AxumState(app_state): AxumState<AppState>,
+    AxumPath(job_id): AxumPath<u64>,
+    ctx: RequestContext,
+) -> crate::Result<axum::Json<MigrationDetails>> {
+    ctx.auth().has_right(ctx.namespace(), Permission::Read)?;
+    {
+        // validate if this is a valid target for the request
+        let store = app_state
+            .namespaces
+            .config_store(ctx.namespace().clone())
+            .await?;
+        let config = (*store.get()).clone();
+        if !config.is_shared_schema {
+            tracing::warn!("invalid namespace: target is not a shared schema");
+            return Err(Error::InvalidNamespace);
+        }
+    }
+
+    let meta_store = app_state.namespaces.meta_store();
+    let details = meta_store
+        .get_migration_details(ctx.namespace().clone(), job_id)
+        .await?;
+    match details {
+        Some(details) => Ok(axum::Json(details)),
+        None => Err(crate::Error::MigrationJobNotFound),
     }
 }

@@ -27,12 +27,18 @@
 //! conn.execute("select 1", ()).await?;
 //! conn.query("select 1", ()).await?;
 //! ```
-use crate::hrana::transaction::HttpTransaction;
+mod rows;
+
+use crate::hrana::transaction::{HttpTransaction, TxScopeCounter};
+use crate::hrana::unwrap_err;
 use crate::{
     hrana::{connection::HttpConnection, HttpSend},
     params::IntoParams,
-    Rows, TransactionBehavior,
+    TransactionBehavior,
 };
+use libsql_hrana::proto::{Batch, Stmt};
+
+pub use crate::wasm::rows::Rows;
 
 cfg_cloudflare! {
     mod cloudflare;
@@ -42,7 +48,7 @@ cfg_cloudflare! {
 #[derive(Debug, Clone)]
 pub struct Connection<T>
 where
-    T: for<'a> HttpSend<'a>,
+    T: HttpSend,
 {
     conn: HttpConnection<T>,
 }
@@ -59,35 +65,50 @@ cfg_cloudflare! {
 
 impl<T> Connection<T>
 where
-    T: for<'a> HttpSend<'a>,
+    T: HttpSend,
+    <T as HttpSend>::Stream: 'static,
 {
     pub async fn execute(&self, sql: &str, params: impl IntoParams) -> crate::Result<u64> {
         tracing::trace!("executing `{}`", sql);
-        let mut stmt =
-            crate::hrana::Statement::from_connection(self.conn.clone(), sql.to_string(), true);
+        let mut stmt = crate::hrana::Statement::new(
+            self.conn.current_stream().clone(),
+            sql.to_string(),
+            true,
+        )?;
         let rows = stmt.execute(&params.into_params()?).await?;
         Ok(rows as u64)
     }
 
     pub async fn execute_batch(&self, sql: &str) -> crate::Result<()> {
-        let mut statements = Vec::new();
-        let stmts = crate::parser::Statement::parse(sql);
-        for s in stmts {
+        let mut stmts = Vec::new();
+        let parse = crate::parser::Statement::parse(sql);
+        let mut c = TxScopeCounter::default();
+        for s in parse {
             let s = s?;
-            statements.push(crate::hrana::proto::Stmt::new(s.stmt, false));
+            c.count(s.kind);
+            stmts.push(Stmt::new(s.stmt, false));
         }
-        self.conn
-            .batch_inner(statements)
+        let stream = self.conn.current_stream();
+        let in_tx_scope = !stream.is_autocommit() || c.begin_tx();
+        let close = !in_tx_scope || c.end_tx();
+        let res = stream
+            .batch_inner(Batch::from_iter(stmts), close)
             .await
             .map_err(|e| crate::Error::Hrana(e.into()))?;
-        Ok(())
+        unwrap_err(&res)
     }
 
     pub async fn query(&self, sql: &str, params: impl IntoParams) -> crate::Result<Rows> {
         tracing::trace!("querying `{}`", sql);
-        let mut stmt =
-            crate::hrana::Statement::from_connection(self.conn.clone(), sql.to_string(), true);
-        stmt.query(&params.into_params()?).await
+        let mut stmt = crate::hrana::Statement::new(
+            self.conn.current_stream().clone(),
+            sql.to_string(),
+            true,
+        )?;
+        let rows = stmt.query_raw(&params.into_params()?).await?;
+        Ok(Rows {
+            inner: Box::new(rows),
+        })
     }
 
     pub async fn transaction(
@@ -105,26 +126,30 @@ where
 #[derive(Debug, Clone)]
 pub struct Transaction<T>
 where
-    T: for<'a> HttpSend<'a>,
+    T: HttpSend,
 {
     inner: HttpTransaction<T>,
 }
 
 impl<T> Transaction<T>
 where
-    T: for<'a> HttpSend<'a>,
+    T: HttpSend,
+    <T as HttpSend>::Stream: 'static,
 {
     pub async fn query(&self, sql: &str, params: impl IntoParams) -> crate::Result<Rows> {
         tracing::trace!("querying `{}`", sql);
         let stream = self.inner.stream().clone();
-        let mut stmt = crate::hrana::Statement::from_stream(stream, sql.to_string(), true);
-        stmt.query(&params.into_params()?).await
+        let mut stmt = crate::hrana::Statement::new(stream, sql.to_string(), true)?;
+        let rows = stmt.query_raw(&params.into_params()?).await?;
+        Ok(Rows {
+            inner: Box::new(rows),
+        })
     }
 
     pub async fn execute(&self, sql: &str, params: impl IntoParams) -> crate::Result<u64> {
         tracing::trace!("executing `{}`", sql);
         let stream = self.inner.stream().clone();
-        let mut stmt = crate::hrana::Statement::from_stream(stream, sql.to_string(), true);
+        let mut stmt = crate::hrana::Statement::new(stream, sql.to_string(), true)?;
         let rows = stmt.execute(&params.into_params()?).await?;
         Ok(rows as u64)
     }
@@ -132,13 +157,18 @@ where
     pub async fn execute_batch(&self, sql: &str) -> crate::Result<()> {
         let mut statements = Vec::new();
         let stmts = crate::parser::Statement::parse(sql);
+        let mut c = TxScopeCounter::default();
         for s in stmts {
             let s = s?;
+            c.count(s.kind);
             statements.push(crate::hrana::proto::Stmt::new(s.stmt, false));
         }
 
-        self.inner
-            .execute_batch(statements)
+        let stream = self.inner.stream();
+        let in_tx_scope = !stream.is_autocommit() || c.begin_tx();
+        let close = !in_tx_scope || c.end_tx();
+        stream
+            .batch_inner(Batch::from_iter(statements), close)
             .await
             .map_err(|e| crate::Error::Hrana(e.into()))?;
         Ok(())

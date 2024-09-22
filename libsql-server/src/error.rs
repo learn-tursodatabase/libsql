@@ -2,7 +2,11 @@ use axum::response::IntoResponse;
 use hyper::StatusCode;
 use tonic::metadata::errors::InvalidMetadataValueBytes;
 
-use crate::{auth::AuthError, namespace::ForkError, query_result_builder::QueryResultBuilderError};
+use crate::{
+    auth::AuthError,
+    namespace::{configurator::fork::ForkError, NamespaceName},
+    query_result_builder::QueryResultBuilderError,
+};
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
@@ -56,12 +60,16 @@ pub enum Error {
     Anyhow(#[from] anyhow::Error),
     #[error("Invalid host header: `{0}`")]
     InvalidHost(String),
+    #[error("Invalid path in URI: `{0}`")]
+    InvalidPath(String),
     #[error("Namespace `{0}` doesn't exist")]
     NamespaceDoesntExist(String),
     #[error("Namespace `{0}` already exists")]
     NamespaceAlreadyExist(String),
     #[error("Invalid namespace")]
     InvalidNamespace,
+    #[error("Invalid namespace bytes: `{0}`")]
+    InvalidNamespaceBytes(Box<dyn std::error::Error + Sync + Send + 'static>),
     #[error("Replica meta error: {0}")]
     ReplicaMetaError(#[from] libsql_replication::meta::Error),
     #[error("Replicator error: {0}")]
@@ -94,12 +102,45 @@ pub enum Error {
     NamespaceStoreShutdown,
     #[error("Unable to update metastore: {0}")]
     MetaStoreUpdateFailure(Box<dyn std::error::Error + Send + Sync>),
+    // This is for errors returned by moka
+    #[error(transparent)]
+    Ref(#[from] std::sync::Arc<Self>),
+    #[error("Unable to decode protobuf: {0}")]
+    ProstDecode(#[from] prost::DecodeError),
+    #[error("Shared schema error: {0}")]
+    SharedSchemaCreationError(String),
+    #[error("Shared schema usage error: {0}")]
+    SharedSchemaUsageError(String),
+
+    #[error("migration error: {0}")]
+    Migration(#[from] crate::schema::Error),
+    #[error("cannot create/update/delete database config while there are pending migration on the shared schema `{0}`")]
+    PendingMigrationOnSchema(NamespaceName),
+    #[error("couldn't find requested migration job")]
+    MigrationJobNotFound,
+    #[error("cannot delete `{0}` because databases are still refering to it")]
+    HasLinkedDbs(NamespaceName),
+    #[error("ATTACH is not permitted in migration scripts")]
+    AttachInMigration,
+    #[error("join failure: {0}")]
+    RuntimeTaskJoinError(#[from] tokio::task::JoinError),
+    #[error("wal error: {0}")]
+    LibsqlWal(#[from] libsql_wal::error::Error),
 }
 
-trait ResponseError: std::error::Error {
+impl AsRef<Self> for Error {
+    fn as_ref(&self) -> &Self {
+        match self {
+            Self::Ref(this) => this.as_ref(),
+            _ => self,
+        }
+    }
+}
+
+pub trait ResponseError: std::error::Error {
     fn format_err(&self, status: StatusCode) -> axum::response::Response {
         let json = serde_json::json!({ "error": self.to_string() });
-        tracing::error!("HTTP API: {}, {}", status, json);
+        tracing::error!("HTTP API: {}, {:?}", status, self);
         (status, axum::Json(json)).into_response()
     }
 }
@@ -108,12 +149,21 @@ impl ResponseError for Error {}
 
 impl IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
+        (&self).into_response()
+    }
+}
+
+impl IntoResponse for &Error {
+    fn into_response(self) -> axum::response::Response {
         use Error::*;
 
         match self {
             FailedToParse(_) => self.format_err(StatusCode::BAD_REQUEST),
             AuthError(_) => self.format_err(StatusCode::UNAUTHORIZED),
-            Anyhow(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            Anyhow(e) => match e.downcast_ref::<Error>() {
+                Some(err) => err.into_response(),
+                None => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            },
             LibSqlInvalidQueryParams(_) => self.format_err(StatusCode::BAD_REQUEST),
             LibSqlTxTimeout => self.format_err(StatusCode::BAD_REQUEST),
             LibSqlTxBusy => self.format_err(StatusCode::TOO_MANY_REQUESTS),
@@ -127,17 +177,19 @@ impl IntoResponse for Error {
             InvalidBatchStep(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             NotAuthorized(_) => self.format_err(StatusCode::UNAUTHORIZED),
             ReplicatorExited => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
-            DbCreateTimeout => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
+            DbCreateTimeout => self.format_err(StatusCode::TOO_MANY_REQUESTS),
             BuilderError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             Blocked(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             Json(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             TooManyRequests => self.format_err(StatusCode::TOO_MANY_REQUESTS),
             QueryError(_) => self.format_err(StatusCode::BAD_REQUEST),
             InvalidHost(_) => self.format_err(StatusCode::BAD_REQUEST),
+            InvalidPath(_) => self.format_err(StatusCode::BAD_REQUEST),
             NamespaceDoesntExist(_) => self.format_err(StatusCode::BAD_REQUEST),
             PrimaryConnectionTimeout => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             NamespaceAlreadyExist(_) => self.format_err(StatusCode::BAD_REQUEST),
             InvalidNamespace => self.format_err(StatusCode::BAD_REQUEST),
+            InvalidNamespaceBytes(_) => self.format_err(StatusCode::BAD_REQUEST),
             LoadDumpError(e) => e.into_response(),
             InvalidMetadataBytes(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             ReplicaRestoreError => self.format_err(StatusCode::BAD_REQUEST),
@@ -145,7 +197,12 @@ impl IntoResponse for Error {
             ConflictingRestoreParameters => self.format_err(StatusCode::BAD_REQUEST),
             Fork(e) => e.into_response(),
             FatalReplicationError => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
-            ReplicatorError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            ReplicatorError(e) => match e {
+                libsql_replication::replicator::Error::NamespaceDoesntExist => {
+                    self.format_err(StatusCode::NOT_FOUND)
+                }
+                _ => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            },
             ReplicaMetaError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             PrimaryStreamDisconnect => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             PrimaryStreamMisuse => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -153,15 +210,24 @@ impl IntoResponse for Error {
             UrlParseError(_) => self.format_err(StatusCode::BAD_REQUEST),
             NamespaceStoreShutdown => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
             MetaStoreUpdateFailure(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            Ref(this) => this.as_ref().into_response(),
+            ProstDecode(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            SharedSchemaCreationError(_) => self.format_err(StatusCode::BAD_REQUEST),
+            SharedSchemaUsageError(_) => self.format_err(StatusCode::BAD_REQUEST),
+            Migration(e) => e.into_response(),
+            PendingMigrationOnSchema(_) => self.format_err(StatusCode::BAD_REQUEST),
+            MigrationJobNotFound => self.format_err(StatusCode::NOT_FOUND),
+            HasLinkedDbs(_) => self.format_err(StatusCode::BAD_REQUEST),
+            AttachInMigration => self.format_err(StatusCode::BAD_REQUEST),
+            RuntimeTaskJoinError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            LibsqlWal(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }
 }
 
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
-        let backtrace = std::backtrace::Backtrace::force_capture();
-
-        tracing::error!("IO error reported: {}, {:?}", value, backtrace);
+        tracing::error!("IO error reported: {:?}", value);
 
         Error::IOError(value)
     }
@@ -223,11 +289,13 @@ pub enum LoadDumpError {
     NoTxn,
     #[error("The dump should commit the transaction.")]
     NoCommit,
+    #[error("Path is not a file")]
+    NotAFile,
 }
 
 impl ResponseError for LoadDumpError {}
 
-impl IntoResponse for LoadDumpError {
+impl IntoResponse for &LoadDumpError {
     fn into_response(self) -> axum::response::Response {
         use LoadDumpError::*;
 
@@ -240,6 +308,7 @@ impl IntoResponse for LoadDumpError {
             | UnsupportedUrlScheme(_)
             | NoTxn
             | NoCommit
+            | NotAFile
             | DumpFilePathNotAbsolute => self.format_err(StatusCode::BAD_REQUEST),
         }
     }
@@ -247,7 +316,7 @@ impl IntoResponse for LoadDumpError {
 
 impl ResponseError for ForkError {}
 
-impl IntoResponse for ForkError {
+impl IntoResponse for &ForkError {
     fn into_response(self) -> axum::response::Response {
         match self {
             ForkError::Internal(_)
@@ -256,6 +325,7 @@ impl IntoResponse for ForkError {
             | ForkError::BackupServiceNotConfigured
             | ForkError::CreateNamespace(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             ForkError::ForkReplica => self.format_err(StatusCode::BAD_REQUEST),
+            ForkError::ForkNoStorage => self.format_err(StatusCode::BAD_REQUEST),
         }
     }
 }

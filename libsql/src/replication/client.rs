@@ -3,7 +3,6 @@ use std::task::{Context, Poll};
 
 use anyhow::Context as _;
 use http::Uri;
-use hyper_rustls::HttpsConnectorBuilder;
 use libsql_replication::rpc::proxy::{
     proxy_client::ProxyClient, DescribeRequest, DescribeResult, ExecuteResults, ProgramReq,
 };
@@ -22,7 +21,7 @@ use tower_http::{
 };
 use uuid::Uuid;
 
-use crate::util::ConnectorService;
+use crate::util::{ConnectorService, HttpRequestCallback};
 
 use crate::util::box_clone_service::BoxCloneService;
 
@@ -47,6 +46,8 @@ impl Client {
         origin: Uri,
         auth_token: impl AsRef<str>,
         version: Option<&str>,
+        http_request_callback: Option<HttpRequestCallback>,
+        maybe_namespace: Option<String>,
     ) -> anyhow::Result<Self> {
         let ver = version.unwrap_or(env!("CARGO_PKG_VERSION"));
 
@@ -58,10 +59,17 @@ impl Client {
             .try_into()
             .context("Invalid auth token must be ascii")?;
 
-        let ns = split_namespace(origin.host().unwrap()).unwrap_or_else(|_| "default".to_string());
+        let ns = if let Some(ns_from_arg) = maybe_namespace {
+            ns_from_arg
+        } else if let Ok(ns_from_host) = split_namespace(origin.host().unwrap()) {
+            ns_from_host
+        } else {
+            "default".to_string()
+        };
+        
         let namespace = BinaryMetadataValue::from_bytes(ns.as_bytes());
 
-        let channel = GrpcChannel::new(connector);
+        let channel = GrpcChannel::new(connector, http_request_callback);
 
         let interceptor = GrpcInterceptor {
             auth_token,
@@ -88,6 +96,10 @@ impl Client {
             replication,
             proxy,
         })
+    }
+
+    pub fn new_client_id(&mut self) {
+        self.client_id = Uuid::new_v4();
     }
 
     pub fn client_id(&self) -> String {
@@ -120,20 +132,33 @@ pub struct GrpcChannel {
 }
 
 impl GrpcChannel {
-    pub fn new(connector: ConnectorService) -> Self {
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(connector);
-
-        let client = hyper::Client::builder().build(https);
+    pub fn new(
+        connector: ConnectorService,
+        http_request_callback: Option<HttpRequestCallback>,
+    ) -> Self {
+        let client = hyper::Client::builder()
+            .pool_idle_timeout(None)
+            .pool_max_idle_per_host(3)
+            .build(connector);
         let client = GrpcWebClientService::new(client);
 
         let classifier = GrpcErrorsAsFailures::new().with_success(GrpcCode::FailedPrecondition);
 
         let svc = ServiceBuilder::new()
             .layer(TraceLayer::new(SharedClassifier::new(classifier)))
+            .map_request(move |request: http::Request<BoxBody>| {
+                if let Some(cb) = &http_request_callback {
+                    let (parts, body) = request.into_parts();
+                    let mut req_copy = http::Request::from_parts(parts, ());
+                    cb(&mut req_copy);
+
+                    let (parts, _) = req_copy.into_parts();
+
+                    http::Request::from_parts(parts, body)
+                } else {
+                    request
+                }
+            })
             .service(client);
 
         let client = BoxCloneService::new(svc);

@@ -30,6 +30,8 @@ pub enum StmtKind {
     Write,
     Savepoint,
     Release,
+    Attach,
+    Detach,
     Other,
 }
 
@@ -116,6 +118,9 @@ impl StmtKind {
                 savepoint_name: Some(_),
                 ..
             }) => Some(Self::Release),
+            Cmd::Stmt(Stmt::Attach { .. }) => Some(Self::Attach),
+            Cmd::Stmt(Stmt::Detach(_)) => Some(Self::Detach),
+            Cmd::Stmt(Stmt::Reindex { .. }) => Some(Self::Write),
             _ => None,
         }
     }
@@ -124,14 +129,14 @@ impl StmtKind {
         let name = name.name.0.as_str();
         match name {
             // always ok to be served by primary or replicas - pure readonly pragmas
-            "table_list" | "index_list" | "table_info" | "table_xinfo" | "index_xinfo"
+            "table_list" | "index_list" | "table_info" | "table_xinfo" | "index_info" | "index_xinfo"
             | "pragma_list" | "compile_options" | "database_list" | "function_list"
             | "module_list" => Some(Self::Read),
             // special case for `encoding` - it's effectively readonly for connections
             // that already created a database, which is always the case for sqld
             "encoding" => Some(Self::Read),
             // always ok to be served by primary
-            "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
+            "defer_foreign_keys" | "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
             | "data_version" | "freelist_count" | "integrity_check" | "legacy_file_format"
             | "page_count" | "quick_check" | "stats" | "user_version" => Some(Self::Write),
             // ok to be served by primary without args
@@ -144,7 +149,6 @@ impl StmtKind {
             | "cache_spill"
             | "cell_size_check"
             | "checkpoint_fullfsync"
-            | "defer_foreign_keys"
             | "fullfsync"
             | "hard_heap_limit"
             | "journal_mode"
@@ -253,5 +257,45 @@ impl Statement {
             self.kind,
             StmtKind::Read | StmtKind::TxnBeginReadOnly | StmtKind::TxnEnd
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_attach_same_db() {
+        let input = "ATTACH test AS test;";
+        let mut result = Statement::parse(input);
+
+        let stmt = result.next().unwrap().unwrap();
+        assert_eq!(stmt.kind, StmtKind::Attach);
+    }
+
+    #[test]
+    fn test_attach_database() {
+        let input = "ATTACH DATABASE test AS test;";
+        let mut result = Statement::parse(input);
+
+        let stmt = result.next().unwrap().unwrap();
+        assert_eq!(stmt.kind, StmtKind::Attach);
+    }
+
+    #[test]
+    fn test_attach_diff_db() {
+        let input = "ATTACH \"random\" AS test;";
+        let mut result = Statement::parse(input);
+
+        let stmt = result.next().unwrap().unwrap();
+        assert_eq!(stmt.kind, StmtKind::Attach);
+    }
+
+    #[test]
+    fn test_attach_database_diff_db() {
+        let input = "ATTACH DATABASE \"random\" AS test;";
+        let mut result = Statement::parse(input);
+
+        let stmt = result.next().unwrap().unwrap();
+        assert_eq!(stmt.kind, StmtKind::Attach);
     }
 }

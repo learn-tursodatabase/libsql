@@ -9,7 +9,7 @@ use tokio::pin;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::auth::Auth;
-use crate::namespace::{MakeNamespace, NamespaceStore};
+use crate::namespace::NamespaceStore;
 use crate::net::Conn;
 use crate::utils::services::idle_shutdown::IdleKicker;
 
@@ -20,9 +20,9 @@ mod handshake;
 mod protobuf;
 mod session;
 
-struct Server<F: MakeNamespace> {
-    namespaces: NamespaceStore<F>,
-    auth: Arc<Auth>,
+struct Server {
+    namespaces: NamespaceStore,
+    user_auth_strategy: Auth,
     idle_kicker: Option<IdleKicker>,
     max_response_size: u64,
     next_conn_id: AtomicU64,
@@ -42,18 +42,18 @@ pub struct Upgrade {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn serve<F: MakeNamespace>(
-    auth: Arc<Auth>,
+pub async fn serve(
+    user_auth_strategy: Auth,
     idle_kicker: Option<IdleKicker>,
     max_response_size: u64,
     mut accept_rx: mpsc::Receiver<Accept>,
     mut upgrade_rx: mpsc::Receiver<Upgrade>,
-    namespaces: NamespaceStore<F>,
+    namespaces: NamespaceStore,
     disable_default_namespace: bool,
     disable_namespaces: bool,
 ) -> Result<()> {
     let server = Arc::new(Server {
-        auth,
+        user_auth_strategy,
         idle_kicker,
         max_response_size,
         next_conn_id: AtomicU64::new(0),

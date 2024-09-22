@@ -1,0 +1,9 @@
+---
+source: libsql-server/tests/standalone/attach.rs
+expression: "txn.execute(\"ATTACH DATABASE bar as bar\", ()).await.unwrap_err()"
+---
+Hrana(
+    Api(
+        "{\"error\":\"Not authorized to execute query: Current session doesn't not have AttachRead permission to namespace bar\"}",
+    ),
+)
