@@ -57,13 +57,23 @@ impl Connection {
                 )));
             }
         }
-
-        Ok(Connection {
+        let conn = Connection {
             raw,
             drop_ref: Arc::new(()),
             #[cfg(feature = "replication")]
             writer: db.writer()?,
-        })
+        };
+        #[cfg(feature = "sync")]
+        if let Some(_) = db.sync_ctx {
+            // We need to make sure database is in WAL mode with checkpointing
+            // disabled so that we can sync our changes back to a remote
+            // server.
+            conn.query("PRAGMA journal_mode = WAL", Params::None)?;
+            unsafe {
+                ffi::libsql_wal_disable_checkpoint(conn.raw);
+            }
+        }
+        Ok(conn)
     }
 
     /// Get a raw handle to the underlying libSQL connection
@@ -345,6 +355,11 @@ impl Connection {
         Transaction::begin(self.clone(), tx_behavior)
     }
 
+    pub fn interrupt(&self) -> Result<()> {
+        unsafe { ffi::sqlite3_interrupt(self.raw) };
+        Ok(())
+    }
+
     pub fn is_autocommit(&self) -> bool {
         unsafe { ffi::sqlite3_get_autocommit(self.raw) != 0 }
     }
@@ -433,6 +448,114 @@ impl Connection {
                 unsafe { ffi::sqlite3_free(raw_err_msg as *mut std::ffi::c_void) };
                 Err(errors::Error::SqliteFailure(err, err_msg))
             }
+        }
+    }
+
+    pub(crate) fn wal_frame_count(&self) -> u32 {
+        let mut max_frame_no: std::os::raw::c_uint = 0;
+        unsafe { libsql_sys::ffi::libsql_wal_frame_count(self.handle(), &mut max_frame_no) };
+
+        max_frame_no
+    }
+
+    pub(crate) fn wal_get_frame(&self, frame_no: u32, page_size: u32) -> Result<bytes::BytesMut> {
+        use bytes::BufMut;
+
+        let frame_size: usize = 24 + page_size as usize;
+
+        // Use a BytesMut to provide cheaper clones of frame data (think retries)
+        // and more efficient buffer usage for extracting wal frames and spliting them off.
+        let mut buf = bytes::BytesMut::with_capacity(frame_size);
+
+        if frame_no == 0 {
+            return Err(errors::Error::SqliteFailure(
+                1,
+                "frame_no must be non-zero".to_string(),
+            ));
+        }
+
+        let rc = unsafe {
+            libsql_sys::ffi::libsql_wal_get_frame(
+                self.handle(),
+                frame_no,
+                buf.chunk_mut().as_mut_ptr() as *mut _,
+                frame_size as u32,
+            )
+        };
+
+        if rc != 0 {
+            return Err(crate::errors::Error::SqliteFailure(
+                rc as std::ffi::c_int,
+                format!("Failed to get frame: {}", frame_no),
+            ));
+        }
+
+        unsafe { buf.advance_mut(frame_size) };
+
+        Ok(buf)
+    }
+
+    fn wal_insert_begin(&self) -> Result<()> {
+        let rc = unsafe { libsql_sys::ffi::libsql_wal_insert_begin(self.handle()) };
+        if rc != 0 {
+            return Err(crate::errors::Error::SqliteFailure(
+                rc as std::ffi::c_int,
+                format!("wal_insert_begin failed"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn wal_insert_end(&self) -> Result<()> {
+        let rc = unsafe { libsql_sys::ffi::libsql_wal_insert_end(self.handle()) };
+        if rc != 0 {
+            return Err(crate::errors::Error::SqliteFailure(
+                rc as std::ffi::c_int,
+                format!("wal_insert_end failed"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn wal_insert_frame(&self, frame: &[u8]) -> Result<()> {
+        let rc = unsafe {
+            libsql_sys::ffi::libsql_wal_insert_frame(
+                self.handle(),
+                frame.len() as u32,
+                frame.as_ptr() as *mut std::ffi::c_void,
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(crate::errors::Error::SqliteFailure(
+                rc as std::ffi::c_int,
+                format!("wal_insert_frame failed"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wal_insert_handle(&self) -> Result<WalInsertHandle<'_>> {
+        self.wal_insert_begin()?;
+        Ok(WalInsertHandle { conn: self })
+    }
+}
+
+pub(crate) struct WalInsertHandle<'a> {
+    conn: &'a Connection,
+}
+
+impl WalInsertHandle<'_> {
+    pub fn insert(&self, frame: &[u8]) -> Result<()> {
+        self.conn.wal_insert_frame(frame)
+    }
+}
+
+impl Drop for WalInsertHandle<'_> {
+    fn drop(&mut self) {
+        if let Err(err) = self.conn.wal_insert_end() {
+            tracing::error!("{:?}", err);
+            Err(err).unwrap()
         }
     }
 }

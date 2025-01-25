@@ -9,7 +9,7 @@ use bytesize::ByteSize;
 use clap::Parser;
 use hyper::client::HttpConnector;
 use libsql_server::auth::{parse_http_basic_auth_arg, parse_jwt_keys, user_auth_strategies, Auth};
-use libsql_server::wal_toolkit::{S3Args, WalToolkit};
+use libsql_server::wal_toolkit::{S3Args, WalToolkitCommand};
 use tokio::sync::Notify;
 use tokio::time::Duration;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -328,7 +328,7 @@ enum UtilsSubcommands {
         #[clap(flatten)]
         s3_args: S3Args,
         #[clap(subcommand)]
-        command: WalToolkit,
+        command: WalToolkitCommand,
     },
 }
 
@@ -734,33 +734,6 @@ async fn build_server(
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
-    if let Some(ref subcommand) = args.subcommand {
-        match subcommand {
-            UtilsSubcommands::AdminShell {
-                admin_api_url,
-                namespace,
-                auth,
-            } => {
-                let client = libsql_server::admin_shell::AdminShellClient::new(
-                    admin_api_url.clone(),
-                    auth.clone(),
-                );
-                if let Some(ns) = namespace {
-                    client.run_namespace(ns).await?;
-                }
-            }
-            UtilsSubcommands::WalToolkit {
-                command,
-                path,
-                s3_args,
-            } => {
-                command.run(path, s3_args).await?;
-            }
-        }
-
-        return Ok(());
-    }
-
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
@@ -788,6 +761,33 @@ async fn main() -> Result<()> {
                 .with_filter(filter),
         )
         .init();
+
+    if let Some(ref subcommand) = args.subcommand {
+        match subcommand {
+            UtilsSubcommands::AdminShell {
+                admin_api_url,
+                namespace,
+                auth,
+            } => {
+                let client = libsql_server::admin_shell::AdminShellClient::new(
+                    admin_api_url.clone(),
+                    auth.clone(),
+                );
+                if let Some(ns) = namespace {
+                    client.run_namespace(ns).await?;
+                }
+            }
+            UtilsSubcommands::WalToolkit {
+                command,
+                path,
+                s3_args,
+            } => {
+                command.exec(path, s3_args).await?;
+            }
+        }
+
+        return Ok(());
+    }
 
     args.print_welcome_message();
     let server = build_server(&args, set_log_level).await?;

@@ -368,6 +368,8 @@ where
     tracing::info!("setting checkpoint interval to {:?}", period);
     let mut interval = interval(period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Make sure that we don't checkpoint immediately after startup
+    interval.tick().await;
     let mut retry: Option<Duration> = None;
     loop {
         if let Some(retry) = retry.take() {
@@ -1008,12 +1010,13 @@ where
         let make_replication_svc = Box::new({
             let registry = registry.clone();
             let disable_namespaces = self.disable_namespaces;
-            move |store, user_auth, _, _, _| -> BoxReplicationService {
+            move |store, user_auth, _, _, service_internal| -> BoxReplicationService {
                 Box::new(LibsqlReplicationService::new(
                     registry.clone(),
                     store,
                     user_auth,
                     disable_namespaces,
+                    service_internal,
                 ))
             }
         });

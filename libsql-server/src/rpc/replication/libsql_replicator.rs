@@ -29,6 +29,7 @@ pub struct LibsqlReplicationService {
     user_auth_strategy: Option<Auth>,
     disable_namespaces: bool,
     session_token: Bytes,
+    service_internal: bool,
 }
 
 impl LibsqlReplicationService {
@@ -37,6 +38,7 @@ impl LibsqlReplicationService {
         store: NamespaceStore,
         user_auth_strategy: Option<Auth>,
         disable_namespaces: bool,
+        service_internal: bool,
     ) -> Self {
         let session_token = Uuid::new_v4().to_string().into();
         Self {
@@ -45,6 +47,7 @@ impl LibsqlReplicationService {
             store,
             user_auth_strategy,
             session_token,
+            service_internal,
         }
     }
 
@@ -53,8 +56,14 @@ impl LibsqlReplicationService {
         req: &tonic::Request<T>,
         namespace: NamespaceName,
     ) -> Result<(), Status> {
-        super::auth::authenticate(&self.store, req, namespace, &self.user_auth_strategy, false)
-            .await
+        if self.service_internal && req.metadata().get("libsql-proxied").is_some()
+            || !self.service_internal
+        {
+            super::auth::authenticate(&self.store, req, namespace, &self.user_auth_strategy, true)
+                .await
+        } else {
+            Ok(())
+        }
     }
 
     fn encode_session_token(&self, version: usize) -> Uuid {
@@ -73,12 +82,12 @@ pin_project_lite::pin_project! {
         #[pin]
         inner: S,
         flavor: WalFlavor,
-        shared: Arc<SharedWal<StdIO>>,
+        shared: Arc<SharedWal<StdIO, SqldStorage>>,
     }
 }
 
 impl<S> FrameStreamAdapter<S> {
-    fn new(inner: S, flavor: WalFlavor, shared: Arc<SharedWal<StdIO>>) -> Self {
+    fn new(inner: S, flavor: WalFlavor, shared: Arc<SharedWal<StdIO, SqldStorage>>) -> Self {
         Self {
             inner,
             flavor,
@@ -133,7 +142,7 @@ where
                     }
                 }
             }
-            Some(Err(_e)) => todo!(),
+            Some(Err(e)) => Poll::Ready(Some(Err(Status::internal(format!("{e}"))))),
             None => Poll::Ready(None),
         }
     }

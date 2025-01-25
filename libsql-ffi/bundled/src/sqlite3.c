@@ -10939,6 +10939,59 @@ SQLITE_API int sqlite3_preupdate_blobwrite(sqlite3 *);
 SQLITE_API void *libsql_close_hook(sqlite3 *db, void (*xClose)(void *pCtx, sqlite3 *db), void *arg);
 
 /*
+** CAPI3REF: Disable WAL checkpointing
+** METHOD: sqlite3
+**
+** ^The [libsql_wal_disable_checkpoint(D)] interface disables automatic
+** checkpointing of the WAL file for [database connection] D.
+**
+** Note: This function disables WAL checkpointing entirely, including when
+** the last database connection is closed. This is different from
+** sqlite3_wal_autocheckpoint() which only disables automatic checkpoints
+** for the current connection, but still allows checkpointing when the
+** connection is closed.
+*/
+SQLITE_API int libsql_wal_disable_checkpoint(sqlite3 *db);
+
+/*
+** CAPI3REF: Get the number of frames in the WAL file
+** METHOD: sqlite3
+**
+** ^The [libsql_wal_frame_count(D,P)] interface returns the number of frames
+** in the WAL file for [database connection] D into *P.
+*/
+SQLITE_API int libsql_wal_frame_count(sqlite3*, unsigned int*);
+
+/*
+** CAPI3REF: Get a frame from the WAL file
+** METHOD: sqlite3
+**
+** ^The [libsql_wal_get_frame(D,I,P,S)] interface extracts frame I from
+** the WAL file for [database connection] D into memory obtained from
+** [sqlite3_malloc64()] and returns a pointer to that memory. The size of
+** the memory allocated is given by S.
+*/
+SQLITE_API int libsql_wal_get_frame(sqlite3*, unsigned int, void*, unsigned int);
+
+/*
+** CAPI3REF: Begin frame insertion into the WAL
+** METHOD: sqlite3
+*/
+SQLITE_API int libsql_wal_insert_begin(sqlite3*);
+
+/*
+** CAPI3REF: End frame insertion into the WAL
+** METHOD: sqlite3
+*/
+SQLITE_API int libsql_wal_insert_end(sqlite3*);
+
+/*
+** CAPI3REF: Insert a frame into the WAL
+** METHOD: sqlite3
+*/
+SQLITE_API int libsql_wal_insert_frame(sqlite3*, unsigned int, void *, unsigned int);
+
+/*
 ** CAPI3REF: Low-level system error code
 ** METHOD: sqlite3
 **
@@ -13963,6 +14016,7 @@ typedef struct libsql_wal_methods {
   /* Read a page from the write-ahead log, if it is present. */
   int (*xFindFrame)(wal_impl* pWal, unsigned int, unsigned int *);
   int (*xReadFrame)(wal_impl* pWal, unsigned int, int, unsigned char *);
+  int (*xReadFrameRaw)(wal_impl* pWal, unsigned int, int, unsigned char *);
 
   /* If the WAL is not empty, return the size of the database. */
   unsigned int (*xDbsize)(wal_impl* pWal);
@@ -13981,6 +14035,9 @@ typedef struct libsql_wal_methods {
   /* Move the write position of the WAL back to iFrame.  Called in
   ** response to a ROLLBACK TO command. */
   int (*xSavepointUndo)(wal_impl* pWal, unsigned int *aWalData);
+
+  /* Return the number of frames in the WAL */
+  int (*xFrameCount)(wal_impl* pWal, int, unsigned int *);
 
   /* Write a frame or frames to the log. */
   int (*xFrames)(wal_impl* pWal, int, libsql_pghdr *, unsigned int, int, int, int*);
@@ -16378,6 +16435,12 @@ SQLITE_PRIVATE int sqlite3PagerReadFileheader(Pager*, int, unsigned char*);
 SQLITE_PRIVATE void sqlite3PagerSetBusyHandler(Pager*, int(*)(void *), void *);
 SQLITE_PRIVATE int sqlite3PagerSetPagesize(Pager*, u32*, int);
 SQLITE_PRIVATE Pgno sqlite3PagerMaxPageCount(Pager*, Pgno);
+SQLITE_PRIVATE int sqlite3PagerWalFrameCount(Pager *, unsigned int *);
+SQLITE_PRIVATE int sqlite3PagerWalReadFrame(Pager *, unsigned int, void *, unsigned int);
+SQLITE_PRIVATE int sqlite3PagerWalBeginCommit(Pager*);
+SQLITE_PRIVATE int sqlite3PagerWalEndCommit(Pager*);
+SQLITE_PRIVATE int sqlite3PagerWalInsert(Pager*, unsigned int, void *, unsigned int);
+
 SQLITE_PRIVATE void sqlite3PagerSetCachesize(Pager*, int);
 SQLITE_PRIVATE int sqlite3PagerSetSpillsize(Pager*, int);
 SQLITE_PRIVATE void sqlite3PagerSetMmapLimit(Pager *, sqlite3_int64);
@@ -18223,6 +18286,7 @@ struct sqlite3 {
   PreUpdate *pPreUpdate;        /* Context for active pre-update callback */
 #endif /* SQLITE_ENABLE_PREUPDATE_HOOK */
 #ifndef SQLITE_OMIT_WAL
+  int walCheckPointDisabled;
   int (*xWalCallback)(void *, sqlite3 *, const char *, int);
   void *pWalArg;
 #endif
@@ -57270,6 +57334,7 @@ typedef struct libsql_wal_methods {
   /* Read a page from the write-ahead log, if it is present. */
   int (*xFindFrame)(wal_impl* pWal, unsigned int, unsigned int *);
   int (*xReadFrame)(wal_impl* pWal, unsigned int, int, unsigned char *);
+  int (*xReadFrameRaw)(wal_impl* pWal, unsigned int, int, unsigned char *);
 
   /* If the WAL is not empty, return the size of the database. */
   unsigned int (*xDbsize)(wal_impl* pWal);
@@ -57288,6 +57353,9 @@ typedef struct libsql_wal_methods {
   /* Move the write position of the WAL back to iFrame.  Called in
   ** response to a ROLLBACK TO command. */
   int (*xSavepointUndo)(wal_impl* pWal, unsigned int *aWalData);
+
+  /* Return the number of frames in the WAL */
+  int (*xFrameCount)(wal_impl* pWal, int, unsigned int *);
 
   /* Write a frame or frames to the log. */
   int (*xFrames)(wal_impl* pWal, int, libsql_pghdr *, unsigned int, int, int, int*);
@@ -65214,6 +65282,103 @@ SQLITE_PRIVATE int sqlite3PagerCloseWal(Pager *pPager, sqlite3 *db){
   return rc;
 }
 
+/**
+** Return the number of frames in the WAL file.
+**
+** If the pager is not in WAL mode or we failed to obtain an exclusive write lock, returns -1.
+**/
+SQLITE_PRIVATE int sqlite3PagerWalFrameCount(Pager *pPager, unsigned int *pnFrames){
+  if( pagerUseWal(pPager) ){
+    return pPager->wal->methods.xFrameCount(pPager->wal->pData, 0, pnFrames);
+  }else{
+    *pnFrames = 0;
+    return SQLITE_OK;
+  }
+}
+
+SQLITE_PRIVATE int sqlite3PagerWalReadFrameRaw(
+  Pager *pPager,
+  unsigned int iFrame,
+  void *pFrameOut,
+  unsigned int nFrameOutLen
+){
+  if( pagerUseWal(pPager) ){
+    unsigned int nFrameLen = 24+pPager->pageSize;
+    if( nFrameOutLen!=nFrameLen ) return SQLITE_MISUSE;
+    return pPager->wal->methods.xReadFrameRaw(pPager->wal->pData, iFrame, nFrameOutLen, pFrameOut);
+  }else{
+    return SQLITE_ERROR;
+  }
+}
+
+SQLITE_PRIVATE int sqlite3PagerWalBeginCommit(Pager *pPager) {
+  int rc;
+  if (!pagerUseWal(pPager)) {
+    return SQLITE_ERROR;
+  }
+  rc = pagerBeginReadTransaction(pPager);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  return pPager->wal->methods.xBeginWriteTransaction(pPager->wal->pData);
+}
+
+SQLITE_PRIVATE int sqlite3PagerWalEndCommit(Pager *pPager) {
+  int rc = SQLITE_ERROR;
+  if (!pagerUseWal(pPager)) {
+    return rc;
+  }
+  rc = pPager->wal->methods.xEndWriteTransaction(pPager->wal->pData);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  pager_reset(pPager);
+  pager_unlock(pPager);
+  return rc;
+}
+
+SQLITE_PRIVATE int sqlite3PagerWalInsert(Pager *pPager, unsigned int iFrame, void *pBuf, unsigned int nBuf) {
+  int rc = SQLITE_OK;
+
+  if (!pagerUseWal(pPager)) {
+    return SQLITE_ERROR;
+  }
+  unsigned int mxFrame;
+  rc = pPager->wal->methods.xFrameCount(pPager->wal->pData, 1, &mxFrame);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  if (iFrame <= mxFrame) {
+    return SQLITE_OK;
+  }
+  u8 *aFrame = (u8*)pBuf;
+  u32 pgno = sqlite3Get4byte(&aFrame[0]);
+  u32 nTruncate = sqlite3Get4byte(&aFrame[4]);
+  u8 *pData = aFrame + 24;
+
+  PgHdr pghdr;
+  memset(&pghdr, 0, sizeof(PgHdr));
+  pghdr.pPage = NULL;
+  pghdr.pData = pData;
+  pghdr.pExtra = NULL;
+  pghdr.pgno = pgno;
+  pghdr.flags = 0;
+  pghdr.pPager = pPager;
+
+  int isCommit = (nTruncate != 0);
+
+  int nFrames = 0;
+  rc = pPager->wal->methods.xFrames(pPager->wal->pData,
+                                    pPager->pageSize,
+                                    &pghdr,
+                                    nTruncate,
+                                    isCommit,
+                                    pPager->walSyncFlags,
+                                    &nFrames);
+  assert( nFrames == 1 );
+  return rc;
+}
+
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
 /*
 ** If pager pPager is a wal-mode database not in exclusive locking mode,
@@ -67601,9 +67766,14 @@ static int sqlite3WalClose(
       if( pWal->exclusiveMode==WAL_NORMAL_MODE ){
         pWal->exclusiveMode = WAL_EXCLUSIVE_MODE;
       }
-      rc = sqlite3WalCheckpoint(pWal, db,
-          SQLITE_CHECKPOINT_PASSIVE, 0, 0, sync_flags, nBuf, zBuf, 0, 0, NULL, NULL
-      );
+      /* Don't checkpoint on close if automatic WAL checkpointing is disabled. */
+      if( !db->walCheckPointDisabled ){
+        rc = sqlite3WalCheckpoint(pWal, db,
+            SQLITE_CHECKPOINT_PASSIVE, 0, 0, sync_flags, nBuf, zBuf, 0, 0, NULL, NULL
+        );
+      } else {
+        rc = SQLITE_ERROR;
+      }
       if( rc==SQLITE_OK ){
         int bPersist = -1;
         sqlite3OsFileControlHint(
@@ -68732,6 +68902,29 @@ static int sqlite3WalReadFrame(
 }
 
 /*
+** Read the contents of frame iRead from the wal file into buffer pOut
+** (which is nOut bytes in size). Return SQLITE_OK if successful, or an
+** error code otherwise.
+*/
+static int sqlite3WalReadFrameRaw(
+  Wal *pWal,                      /* WAL handle */
+  u32 iRead,                      /* Frame to read */
+  int nOut,                       /* Size of buffer pOut in bytes */
+  u8 *pOut                        /* Buffer to write page data to */
+){
+  int sz;
+  i64 iOffset;
+  sz = pWal->hdr.szPage;
+  sz = (sz&0xfe00) + ((sz&0x0001)<<16);
+  testcase( sz<=32768 );
+  testcase( sz>=65536 );
+  iOffset = walFrameOffset(iRead, sz);
+  /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL */
+  sz += WAL_FRAME_HDRSIZE;
+  return sqlite3OsRead(pWal->pWalFd, pOut, (nOut>sz ? sz : nOut), iOffset);
+}
+
+/*
 ** Return the size of the database in pages (or zero, if unknown).
 */
 static Pgno sqlite3WalDbsize(Wal *pWal){
@@ -69341,6 +69534,19 @@ static int walFrames(
   return rc;
 }
 
+SQLITE_PRIVATE int sqlite3WalFrameCount(Wal *pWal, int locked, unsigned int *pnFrames){
+  int rc = SQLITE_OK;
+  if( locked==0 ) {
+    rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1);
+    if (rc != SQLITE_OK) return rc;
+  }
+  *pnFrames = pWal->hdr.mxFrame;
+  if( locked==0 ) {
+    walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+  }
+  return SQLITE_OK;
+}
+
 /*
 ** Write a set of frames to the log. The caller must hold the write-lock
 ** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
@@ -69840,12 +70046,14 @@ static int sqlite3WalOpen(
     out->methods.xEndReadTransaction = (void (*)(wal_impl *))sqlite3WalEndReadTransaction;
     out->methods.xFindFrame = (int (*)(wal_impl *, unsigned int, unsigned int *))sqlite3WalFindFrame;
     out->methods.xReadFrame = (int (*)(wal_impl *, unsigned int, int, unsigned char *))sqlite3WalReadFrame;
+    out->methods.xReadFrameRaw = (int (*)(wal_impl *, unsigned int, int, unsigned char *))sqlite3WalReadFrameRaw;
     out->methods.xDbsize = (unsigned int (*)(wal_impl *))sqlite3WalDbsize;
     out->methods.xBeginWriteTransaction = (int (*)(wal_impl *))sqlite3WalBeginWriteTransaction;
     out->methods.xEndWriteTransaction = (int (*)(wal_impl *))sqlite3WalEndWriteTransaction;
     out->methods.xUndo = (int (*)(wal_impl *, int (*)(void *, unsigned int), void *))sqlite3WalUndo;
     out->methods.xSavepoint = (void (*)(wal_impl *, unsigned int *))sqlite3WalSavepoint;
     out->methods.xSavepointUndo = (int (*)(wal_impl *, unsigned int *))sqlite3WalSavepointUndo;
+    out->methods.xFrameCount = (int (*)(wal_impl *, int, unsigned int *))sqlite3WalFrameCount;
     out->methods.xFrames = (int (*)(wal_impl *, int, libsql_pghdr *, unsigned int, int, int, int *))sqlite3WalFrames;
     out->methods.xCheckpoint = (int (*)(wal_impl *, sqlite3 *, int, int (*)(void *), void *, int, int, unsigned char *, int *, int *, int (*)(void*, int, const unsigned char*, int, int, int), void*))sqlite3WalCheckpoint;
     out->methods.xCallback = (int (*)(wal_impl *))sqlite3WalCallback;
@@ -85474,8 +85682,9 @@ void blobSpotFree(BlobSpot *pBlobSpot);
 
 /*
  * Accessor for node binary format
- * - v1 format is the following:
- *   [u64 nRowid] [u16 nEdges] [node vector] [edge vector] * nEdges [trash vector] * (nMaxEdges - nEdges) ([u64 legacyField] [u64 edgeId]) * nEdges
+ * - default format is the following:
+ *   [u64 nRowid] [u16 nEdges] [6 byte padding] [node vector] [edge vector] * nEdges [trash vector] * (nMaxEdges - nEdges) ([u32 unused] [f32 distance] [u64 edgeId]) * nEdges
+ *   Note, that 6 byte padding after nEdges required to align [node vector] by word boundary and avoid unaligned reads
  *   Note, that node vector and edge vector can have different representations (and edge vector can be smaller in size than node vector)
 */
 int nodeEdgesMaxCount(const DiskAnnIndex *pIndex);
@@ -85514,9 +85723,11 @@ typedef u8 MetricType;
 /*
  * 1 - v1 version; node block format: [node meta] [node vector] [edge vectors] ... [ [u64 unused               ] [u64 edge rowid] ] ...
  * 2 - v2 version; node block format: [node meta] [node vector] [edge vectors] ... [ [u32 unused] [f32 distance] [u64 edge rowid] ] ...
+ * 3 - v3 version; node meta aligned to 8-byte boundary (instead of having u64 + u16 size - we round it up to u64 + u64)
 */
 #define VECTOR_FORMAT_V1                    1
-#define VECTOR_FORMAT_DEFAULT               2
+#define VECTOR_FORMAT_V2                    2
+#define VECTOR_FORMAT_DEFAULT               3
 
 /* type of the vector index */
 #define VECTOR_INDEX_TYPE_PARAM_ID          2
@@ -85652,7 +85863,7 @@ int vectorIdxParseColumnType(const char *, int *, int *, const char **);
 int vectorIndexCreate(Parse*, const Index*, const char *, const IdList*);
 int vectorIndexClear(sqlite3 *, const char *, const char *);
 int vectorIndexDrop(sqlite3 *, const char *, const char *);
-int vectorIndexSearch(sqlite3 *, const char *, int, sqlite3_value **, VectorOutRows *, int *, int *, char **);
+int vectorIndexSearch(sqlite3 *, int, sqlite3_value **, VectorOutRows *, int *, int *, char **);
 int vectorIndexCursorInit(sqlite3 *, const char *, const char *, VectorIdxCursor **);
 void vectorIndexCursorClose(sqlite3 *, VectorIdxCursor *, int *, int *);
 int vectorIndexInsert(VectorIdxCursor *, const UnpackedRecord *, char **);
@@ -182973,6 +183184,165 @@ void *libsql_close_hook(
 }
 
 /*
+** Disable WAL checkpointing.
+**
+** Note: This function disables WAL checkpointing entirely, including when
+** the last database connection is closed. This is different from
+** sqlite3_wal_autocheckpoint() which only disables automatic checkpoints
+** for the current connection, but still allows checkpointing when the
+** connection is closed.
+**/
+int libsql_wal_disable_checkpoint(sqlite3 *db) {
+#ifndef SQLITE_OMIT_WAL
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+  sqlite3_mutex_enter(db->mutex);
+  db->walCheckPointDisabled = 1;
+  db->xWalCallback = 0;
+  sqlite3_mutex_leave(db->mutex);
+#endif
+  return SQLITE_OK;
+}
+
+/*
+** Return the number of frames in the WAL of the given database.
+*/
+int libsql_wal_frame_count(
+  sqlite3* db,
+  unsigned int *pnFrame
+){
+  int rc = SQLITE_OK;
+  Pager *pPager;
+
+#ifdef SQLITE_OMIT_WAL
+  *pnFrame = 0;
+  return SQLITE_OK;
+#else
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) ) return SQLITE_MISUSE_BKPT;
+#endif
+
+  sqlite3_mutex_enter(db->mutex);
+  pPager = sqlite3BtreePager(db->aDb[0].pBt);
+  rc = sqlite3PagerWalFrameCount(pPager, pnFrame);
+  sqlite3Error(db, rc);
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+#endif
+}
+
+int libsql_wal_get_frame(
+  sqlite3* db,
+  unsigned int iFrame,
+  void *pBuf,
+  unsigned int nBuf
+){
+  int rc = SQLITE_OK;
+  Pager *pPager;
+
+#ifdef SQLITE_OMIT_WAL
+  UNUSED_PARAMETER(iFrame);
+  UNUSED_PARAMETER(nBuf);
+  UNUSED_PARAMETER(pBuf);
+  return SQLITE_OK;
+#else
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) ) return SQLITE_MISUSE_BKPT;
+#endif
+
+  sqlite3_mutex_enter(db->mutex);
+  pPager = sqlite3BtreePager(db->aDb[0].pBt);
+  rc = sqlite3PagerWalReadFrameRaw(pPager, iFrame, pBuf, nBuf);
+  sqlite3Error(db, rc);
+  sqlite3_mutex_leave(db->mutex);
+
+  return rc;
+#endif
+}
+
+/*
+** Begin a WAL commit.
+*/
+int libsql_wal_insert_begin(sqlite3 *db) {
+  Pager *pPager;
+  int rc;
+
+  sqlite3_mutex_enter(db->mutex);
+  pPager = sqlite3BtreePager(db->aDb[0].pBt);
+  rc = sqlite3PagerSharedLock(pPager);
+  if (rc != SQLITE_OK) {
+    goto out_unlock;
+  }
+  int isOpen = 0;
+  rc = sqlite3PagerOpenWal(pPager, &isOpen);
+  if (rc != SQLITE_OK) {
+    goto out_unlock;
+  }
+  rc = sqlite3PagerWalBeginCommit(pPager);
+  if (rc != SQLITE_OK) {
+    goto out_unlock;
+  }
+out_unlock:
+  sqlite3Error(db, rc);
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+
+int libsql_wal_insert_end(sqlite3 *db) {
+  Pager *pPager;
+  int rc;
+
+  sqlite3_mutex_enter(db->mutex);
+  pPager = sqlite3BtreePager(db->aDb[0].pBt);
+  rc = sqlite3PagerWalEndCommit(pPager);
+  if (rc != SQLITE_OK) {
+    goto out_unlock;
+  }
+out_unlock:
+  sqlite3Error(db, rc);
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+
+/*
+** Insert a frame into the WAL.
+*/
+int libsql_wal_insert_frame(
+  sqlite3* db,
+  unsigned int iFrame,
+  void *pBuf,
+  unsigned int nBuf
+){
+  int rc = SQLITE_OK;
+  Pager *pPager;
+
+#ifdef SQLITE_OMIT_WAL
+  *pnFrame = 0;
+  return SQLITE_OK;
+#else
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) ) return SQLITE_MISUSE_BKPT;
+#endif
+
+  sqlite3_mutex_enter(db->mutex);
+  pPager = sqlite3BtreePager(db->aDb[0].pBt);
+  rc = sqlite3PagerWalInsert(pPager, iFrame, pBuf, nBuf);
+  if (rc != SQLITE_OK) {
+    goto out_unlock;
+  }
+out_unlock:
+  sqlite3Error(db, rc);
+  sqlite3_mutex_leave(db->mutex);
+
+  return rc;
+#endif
+}
+
+/*
 ** Register a function to be invoked prior to each autovacuum that
 ** determines the number of pages to vacuum.
 */
@@ -183069,6 +183439,7 @@ SQLITE_API void *sqlite3_wal_hook(
 #endif
   sqlite3_mutex_enter(db->mutex);
   pRet = db->pWalArg;
+  db->walCheckPointDisabled = 0;
   db->xWalCallback = xCallback;
   db->pWalArg = pArg;
   sqlite3_mutex_leave(db->mutex);
@@ -212373,8 +212744,6 @@ SQLITE_PRIVATE void sqlite3RegisterVectorFunctions(void){
 */
 #define DISKANN_BLOCK_SIZE_SHIFT 9
 
-#define VECTOR_NODE_METADATA_SIZE (sizeof(u64) + sizeof(u16))
-#define VECTOR_EDGE_METADATA_SIZE (sizeof(u64) + sizeof(u64))
 
 typedef struct VectorPair VectorPair;
 typedef struct DiskAnnSearchCtx DiskAnnSearchCtx;
@@ -212597,16 +212966,28 @@ void blobSpotFree(BlobSpot *pBlobSpot) {
 ** Layout specific utilities
 **************************************************************************/
 
-int nodeEdgeOverhead(int nEdgeVectorSize){
-  return nEdgeVectorSize + VECTOR_EDGE_METADATA_SIZE;
+int nodeMetadataSize(int nFormatVersion){
+  if( nFormatVersion <= VECTOR_FORMAT_V2 ){
+    return (sizeof(u64) + sizeof(u16));
+  }else{
+    return (sizeof(u64) + sizeof(u64));
+  }
 }
 
-int nodeOverhead(int nNodeVectorSize){
-  return nNodeVectorSize + VECTOR_NODE_METADATA_SIZE;
+int edgeMetadataSize(int nFormatVersion){
+  return (sizeof(u64) + sizeof(u64));
+}
+
+int nodeEdgeOverhead(int nFormatVersion, int nEdgeVectorSize){
+  return nEdgeVectorSize + edgeMetadataSize(nFormatVersion);
+}
+
+int nodeOverhead(int nFormatVersion, int nNodeVectorSize){
+  return nNodeVectorSize + nodeMetadataSize(nFormatVersion);
 }
 
 int nodeEdgesMaxCount(const DiskAnnIndex *pIndex){
-  unsigned int nMaxEdges = (pIndex->nBlockSize - nodeOverhead(pIndex->nNodeVectorSize)) / nodeEdgeOverhead(pIndex->nEdgeVectorSize);
+  unsigned int nMaxEdges = (pIndex->nBlockSize - nodeOverhead(pIndex->nFormatVersion, pIndex->nNodeVectorSize)) / nodeEdgeOverhead(pIndex->nFormatVersion, pIndex->nEdgeVectorSize);
   assert( nMaxEdges > 0);
   return nMaxEdges;
 }
@@ -212614,29 +212995,29 @@ int nodeEdgesMaxCount(const DiskAnnIndex *pIndex){
 int nodeEdgesMetadataOffset(const DiskAnnIndex *pIndex){
   unsigned int offset;
   unsigned int nMaxEdges = nodeEdgesMaxCount(pIndex);
-  offset = VECTOR_NODE_METADATA_SIZE + pIndex->nNodeVectorSize + nMaxEdges * pIndex->nEdgeVectorSize;
+  offset = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + nMaxEdges * pIndex->nEdgeVectorSize;
   assert( offset <= pIndex->nBlockSize );
   return offset;
 }
 
 void nodeBinInit(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, Vector *pVector){
-  assert( VECTOR_NODE_METADATA_SIZE + pIndex->nNodeVectorSize <= pBlobSpot->nBufferSize );
+  assert( nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize <= pBlobSpot->nBufferSize );
 
   memset(pBlobSpot->pBuffer, 0, pBlobSpot->nBufferSize);
   writeLE64(pBlobSpot->pBuffer, nRowid);
   // neighbours count already zero after memset - no need to set it explicitly
 
-  vectorSerializeToBlob(pVector, pBlobSpot->pBuffer + VECTOR_NODE_METADATA_SIZE, pIndex->nNodeVectorSize);
+  vectorSerializeToBlob(pVector, pBlobSpot->pBuffer + nodeMetadataSize(pIndex->nFormatVersion), pIndex->nNodeVectorSize);
 }
 
 void nodeBinVector(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, Vector *pVector) {
-  assert( VECTOR_NODE_METADATA_SIZE + pIndex->nNodeVectorSize <= pBlobSpot->nBufferSize );
+  assert( nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize <= pBlobSpot->nBufferSize );
 
-  vectorInitStatic(pVector, pIndex->nNodeVectorType, pIndex->nVectorDims, pBlobSpot->pBuffer + VECTOR_NODE_METADATA_SIZE);
+  vectorInitStatic(pVector, pIndex->nNodeVectorType, pIndex->nVectorDims, pBlobSpot->pBuffer + nodeMetadataSize(pIndex->nFormatVersion));
 }
 
 u16 nodeBinEdges(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot) {
-  assert( VECTOR_NODE_METADATA_SIZE <= pBlobSpot->nBufferSize );
+  assert( nodeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
 
   return readLE16(pBlobSpot->pBuffer + sizeof(u64));
 }
@@ -212646,20 +213027,20 @@ void nodeBinEdge(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, int iEdg
   int offset = nodeEdgesMetadataOffset(pIndex);
 
   if( pRowid != NULL ){
-    assert( offset + (iEdge + 1) * VECTOR_EDGE_METADATA_SIZE <= pBlobSpot->nBufferSize );
-    *pRowid = readLE64(pBlobSpot->pBuffer + offset + iEdge * VECTOR_EDGE_METADATA_SIZE + sizeof(u64));
+    assert( offset + (iEdge + 1) * edgeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
+    *pRowid = readLE64(pBlobSpot->pBuffer + offset + iEdge * edgeMetadataSize(pIndex->nFormatVersion) + sizeof(u64));
   }
   if( pIndex->nFormatVersion != VECTOR_FORMAT_V1 && pDistance != NULL ){
-    distance = readLE32(pBlobSpot->pBuffer + offset + iEdge * VECTOR_EDGE_METADATA_SIZE + sizeof(u32));
+    distance = readLE32(pBlobSpot->pBuffer + offset + iEdge * edgeMetadataSize(pIndex->nFormatVersion) + sizeof(u32));
     *pDistance = *((float*)&distance);
   }
   if( pVector != NULL ){
-    assert( VECTOR_NODE_METADATA_SIZE + pIndex->nNodeVectorSize + iEdge * pIndex->nEdgeVectorSize < offset );
+    assert( nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iEdge * pIndex->nEdgeVectorSize < offset );
     vectorInitStatic(
       pVector,
       pIndex->nEdgeVectorType,
       pIndex->nVectorDims,
-      pBlobSpot->pBuffer + VECTOR_NODE_METADATA_SIZE + pIndex->nNodeVectorSize + iEdge * pIndex->nEdgeVectorSize
+      pBlobSpot->pBuffer + nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iEdge * pIndex->nEdgeVectorSize
     );
   }
 }
@@ -212696,11 +213077,11 @@ void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iRe
     nEdges++;
   }
 
-  edgeVectorOffset = VECTOR_NODE_METADATA_SIZE + pIndex->nNodeVectorSize + iReplace * pIndex->nEdgeVectorSize;
-  edgeMetaOffset = nodeEdgesMetadataOffset(pIndex) + iReplace * VECTOR_EDGE_METADATA_SIZE;
+  edgeVectorOffset = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iReplace * pIndex->nEdgeVectorSize;
+  edgeMetaOffset = nodeEdgesMetadataOffset(pIndex) + iReplace * edgeMetadataSize(pIndex->nFormatVersion);
 
   assert( edgeVectorOffset + pIndex->nEdgeVectorSize <= pBlobSpot->nBufferSize );
-  assert( edgeMetaOffset + VECTOR_EDGE_METADATA_SIZE <= pBlobSpot->nBufferSize );
+  assert( edgeMetaOffset + edgeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
 
   vectorSerializeToBlob(pVector, pBlobSpot->pBuffer + edgeVectorOffset, pIndex->nEdgeVectorSize);
   writeLE32(pBlobSpot->pBuffer + edgeMetaOffset + sizeof(u32), *((u32*)&distance));
@@ -212716,19 +213097,19 @@ void nodeBinDeleteEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iDel
 
   assert( 0 <= iDelete && iDelete < nEdges );
 
-  edgeVectorOffset = VECTOR_NODE_METADATA_SIZE + pIndex->nNodeVectorSize + iDelete * pIndex->nEdgeVectorSize;
-  lastVectorOffset = VECTOR_NODE_METADATA_SIZE + pIndex->nNodeVectorSize + (nEdges - 1) * pIndex->nEdgeVectorSize;
-  edgeMetaOffset = nodeEdgesMetadataOffset(pIndex) + iDelete * VECTOR_EDGE_METADATA_SIZE;
-  lastMetaOffset = nodeEdgesMetadataOffset(pIndex) + (nEdges - 1) * VECTOR_EDGE_METADATA_SIZE;
+  edgeVectorOffset = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iDelete * pIndex->nEdgeVectorSize;
+  lastVectorOffset = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + (nEdges - 1) * pIndex->nEdgeVectorSize;
+  edgeMetaOffset = nodeEdgesMetadataOffset(pIndex) + iDelete * edgeMetadataSize(pIndex->nFormatVersion);
+  lastMetaOffset = nodeEdgesMetadataOffset(pIndex) + (nEdges - 1) * edgeMetadataSize(pIndex->nFormatVersion);
 
   assert( edgeVectorOffset + pIndex->nEdgeVectorSize <= pBlobSpot->nBufferSize );
   assert( lastVectorOffset + pIndex->nEdgeVectorSize <= pBlobSpot->nBufferSize );
-  assert( edgeMetaOffset + VECTOR_EDGE_METADATA_SIZE <= pBlobSpot->nBufferSize );
-  assert( lastMetaOffset + VECTOR_EDGE_METADATA_SIZE <= pBlobSpot->nBufferSize );
+  assert( edgeMetaOffset + edgeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
+  assert( lastMetaOffset + edgeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
 
   if( edgeVectorOffset < lastVectorOffset ){
     memmove(pBlobSpot->pBuffer + edgeVectorOffset, pBlobSpot->pBuffer + lastVectorOffset, pIndex->nEdgeVectorSize);
-    memmove(pBlobSpot->pBuffer + edgeMetaOffset, pBlobSpot->pBuffer + lastMetaOffset, VECTOR_EDGE_METADATA_SIZE);
+    memmove(pBlobSpot->pBuffer + edgeMetaOffset, pBlobSpot->pBuffer + lastMetaOffset, edgeMetadataSize(pIndex->nFormatVersion));
   }
 
   writeLE16(pBlobSpot->pBuffer + sizeof(u64), nEdges - 1);
@@ -212814,9 +213195,9 @@ int diskAnnCreateIndex(
   if( maxNeighborsParam == 0 ){
     // 3 D**(1/2) gives good recall values (90%+)
     // we also want to keep disk overhead at moderate level - 50x of the disk size increase is the current upper bound
-    maxNeighborsParam = MIN(3 * ((int)(sqrt(dims)) + 1), (50 * nodeOverhead(vectorDataSize(type, dims))) / nodeEdgeOverhead(vectorDataSize(neighbours, dims)) + 1);
+    maxNeighborsParam = MIN(3 * ((int)(sqrt(dims)) + 1), (50 * nodeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(type, dims))) / nodeEdgeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(neighbours, dims)) + 1);
   }
-  blockSizeBytes = nodeOverhead(vectorDataSize(type, dims)) + maxNeighborsParam * (u64)nodeEdgeOverhead(vectorDataSize(neighbours, dims));
+  blockSizeBytes = nodeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(type, dims)) + maxNeighborsParam * (u64)nodeEdgeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(neighbours, dims));
   if( blockSizeBytes > DISKANN_MAX_BLOCK_SZ ){
     return SQLITE_ERROR;
   }
@@ -215829,17 +216210,25 @@ out:
 
 int vectorIndexGetParameters(
   sqlite3 *db,
+  const char *zDbSName,
   const char *zIdxName,
   VectorIdxParams *pParams
 ) {
   int rc = SQLITE_OK;
+  assert( zDbSName != NULL );
 
-  static const char* zSelectSql = "SELECT metadata FROM " VECTOR_INDEX_GLOBAL_META_TABLE " WHERE name = ?";
+  static const char *zSelectSqlTemplate = "SELECT metadata FROM \"%w\"." VECTOR_INDEX_GLOBAL_META_TABLE " WHERE name = ?";
+  char* zSelectSql;
+  zSelectSql = sqlite3_mprintf(zSelectSqlTemplate, zDbSName);
+  if( zSelectSql == NULL ){
+    return SQLITE_NOMEM_BKPT;
+  }
   // zSelectSqlPekkaLegacy handles the case when user created DB before 04 July 2024 (https://discord.com/channels/933071162680958986/1225560924526477322/1258367912402489397)
   // when instead of table with binary parameters rigid schema was used for index settings
   // we should drop this eventually - but for now we postponed this decision
   static const char* zSelectSqlPekkaLegacy = "SELECT vector_type, block_size, dims, distance_ops FROM libsql_vector_index WHERE name = ?";
   rc = vectorIndexTryGetParametersFromBinFormat(db, zSelectSql, zIdxName, pParams);
+  sqlite3_free(zSelectSql);
   if( rc == SQLITE_OK ){
     return SQLITE_OK;
   }
@@ -216022,9 +216411,32 @@ int vectorIndexCreate(Parse *pParse, const Index *pIdx, const char *zDbSName, co
   return CREATE_OK;
 }
 
+// extracts schema and index name part if full index name is composite (e.g. schema_name.index_name)
+// if full index name has no schema part - function returns SQLITE_OK but leaves pzIdxDbSName and pzIdxName untouched
+int getIndexNameParts(sqlite3 *db, const char *zIdxFullName, char **pzIdxDbSName, char **pzIdxName) {
+  int nFullName, nDbSName;
+  const char *pDot = zIdxFullName;
+  while( *pDot != '.' && *pDot != '\0' ){
+    pDot++;
+  }
+  if( *pDot == '\0' ){
+    return SQLITE_OK;
+  }
+  assert( *pDot == '.' );
+  nFullName = sqlite3Strlen30(zIdxFullName);
+  nDbSName = pDot - zIdxFullName;
+  *pzIdxDbSName = sqlite3DbStrNDup(db, zIdxFullName, nDbSName);
+  *pzIdxName = sqlite3DbStrNDup(db, pDot + 1, nFullName - nDbSName - 1);
+  if( pzIdxName == NULL || pzIdxDbSName == NULL ){
+    sqlite3DbFree(db, *pzIdxName);
+    sqlite3DbFree(db, *pzIdxDbSName);
+    return SQLITE_NOMEM_BKPT;
+  }
+  return SQLITE_OK;
+}
+
 int vectorIndexSearch(
   sqlite3 *db,
-  const char* zDbSName,
   int argc,
   sqlite3_value **argv,
   VectorOutRows *pRows,
@@ -216032,8 +216444,13 @@ int vectorIndexSearch(
   int *nWrites,
   char **pzErrMsg
 ) {
-  int type, dims, k, rc;
-  const char *zIdxName;
+  int type, dims, k, rc, iDb = -1;
+  double kDouble;
+  const char *zIdxFullName;
+  char *zIdxDbSNameAlloc = NULL;  // allocated managed schema name string - must be freed if not null
+  char *zIdxNameAlloc = NULL;     // allocated managed index name string - must be freed if not null
+  const char *zIdxDbSName = NULL; // schema name of the index (can be static in cases where explicit schema is omitted - so must not be freed)
+  const char *zIdxName = NULL;    // index name (can be extracted with sqlite3_value_text and managed by SQLite - so must not be freed)
   const char *zErrMsg;
   Vector *pVector = NULL;
   DiskAnnIndex *pDiskAnn = NULL;
@@ -216041,8 +216458,6 @@ int vectorIndexSearch(
   VectorIdxKey pKey;
   VectorIdxParams idxParams;
   vectorIdxParamsInit(&idxParams, NULL, 0);
-
-  assert( zDbSName != NULL );
 
   if( argc != 3 ){
     *pzErrMsg = sqlite3_mprintf("vector index(search): got %d parameters, expected 3", argc);
@@ -216063,35 +216478,76 @@ int vectorIndexSearch(
     rc = SQLITE_ERROR;
     goto out;
   }
-  if( sqlite3_value_type(argv[2]) != SQLITE_INTEGER ){
-    *pzErrMsg = sqlite3_mprintf("vector index(search): third parameter (k) must be a non-negative integer");
+  if( sqlite3_value_type(argv[2]) == SQLITE_INTEGER ){
+    k = sqlite3_value_int(argv[2]);
+    if( k < 0 ){
+      *pzErrMsg = sqlite3_mprintf("vector index(search): third parameter (k) must be a non-negative integer, but negative value were provided");
+      rc = SQLITE_ERROR;
+      goto out;
+    }
+  }else if( sqlite3_value_type(argv[2]) == SQLITE_FLOAT ) {
+    kDouble = sqlite3_value_double(argv[2]);
+    k = (int)kDouble;
+    if( (double)k != kDouble ){
+      *pzErrMsg = sqlite3_mprintf("vector index(search): third parameter (k) must be an integer, but float value were provided");
+      rc = SQLITE_ERROR;
+      goto out;
+    }
+    if( k < 0 ){
+      *pzErrMsg = sqlite3_mprintf("vector index(search): third parameter (k) must be a non-negative integer, but negative value were provided");
+      rc = SQLITE_ERROR;
+      goto out;
+    }
+  }else{
+    *pzErrMsg = sqlite3_mprintf("vector index(search): third parameter (k) must be an integer, but unexpected type of value were provided");
     rc = SQLITE_ERROR;
     goto out;
   }
-  k = sqlite3_value_int(argv[2]);
-  if( k < 0 ){
-    *pzErrMsg = sqlite3_mprintf("vector index(search): third parameter (k) must be a non-negative integer");
-    rc = SQLITE_ERROR;
-    goto out;
-  }
+
   if( sqlite3_value_type(argv[0]) != SQLITE_TEXT ){
     *pzErrMsg = sqlite3_mprintf("vector index(search): first parameter (index) must be a string");
     rc = SQLITE_ERROR;
     goto out;
   }
-  zIdxName = (const char*)sqlite3_value_text(argv[0]);
-  if( vectorIndexGetParameters(db, zIdxName, &idxParams) != 0 ){
+  zIdxFullName = (const char*)sqlite3_value_text(argv[0]);
+  rc = getIndexNameParts(db, zIdxFullName, &zIdxDbSNameAlloc, &zIdxNameAlloc);
+  if( rc != SQLITE_OK ){
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to parse index name");
+    goto out;
+  }
+  assert( (zIdxDbSNameAlloc == NULL && zIdxNameAlloc == NULL) || (zIdxDbSNameAlloc != NULL && zIdxNameAlloc != NULL) );
+  if( zIdxDbSNameAlloc == NULL && zIdxNameAlloc == NULL ){
+    zIdxDbSName = "main";
+    zIdxName = zIdxFullName;
+  } else{
+    zIdxDbSName = zIdxDbSNameAlloc;
+    zIdxName = zIdxNameAlloc;
+    iDb = sqlite3FindDbName(db, zIdxDbSName);
+    if( iDb < 0 ){
+      *pzErrMsg = sqlite3_mprintf("vector index(search): unknown schema '%s'", zIdxDbSName);
+      rc = SQLITE_ERROR;
+      goto out;
+    }
+    // we need to hold mutex to protect schema against unwanted changes
+    // this code is necessary, otherwise sqlite3SchemaMutexHeld assert will fail
+    if( iDb !=1 ){
+      // not "main" DB which we already hold mutex for
+      sqlite3BtreeEnter(db->aDb[iDb].pBt);
+    }
+  }
+
+  if( vectorIndexGetParameters(db, zIdxDbSName, zIdxName, &idxParams) != 0 ){
     *pzErrMsg = sqlite3_mprintf("vector index(search): failed to parse vector index parameters");
     rc = SQLITE_ERROR;
     goto out;
   }
-  pIndex = sqlite3FindIndex(db, zIdxName, zDbSName);
+  pIndex = sqlite3FindIndex(db, zIdxName, zIdxDbSName);
   if( pIndex == NULL ){
     *pzErrMsg = sqlite3_mprintf("vector index(search): index not found");
     rc = SQLITE_ERROR;
     goto out;
   }
-  rc = diskAnnOpenIndex(db, zDbSName, zIdxName, &idxParams, &pDiskAnn);
+  rc = diskAnnOpenIndex(db, zIdxDbSName, zIdxName, &idxParams, &pDiskAnn);
   if( rc != SQLITE_OK ){
     *pzErrMsg = sqlite3_mprintf("vector index(search): failed to open diskann index");
     goto out;
@@ -216110,6 +216566,11 @@ out:
   }
   if( pVector != NULL ){
     vectorFree(pVector);
+  }
+  sqlite3DbFree(db, zIdxNameAlloc);
+  sqlite3DbFree(db, zIdxDbSNameAlloc);
+  if( iDb >= 0 && iDb != 1 ){
+    sqlite3BtreeLeave(db->aDb[iDb].pBt);
   }
   return rc;
 }
@@ -216160,7 +216621,7 @@ int vectorIndexCursorInit(
 
   assert( zDbSName != NULL );
 
-  if( vectorIndexGetParameters(db, zIndexName, &params) != 0 ){
+  if( vectorIndexGetParameters(db, zDbSName, zIndexName, &params) != 0 ){
     return SQLITE_ERROR;
   }
   pCursor = sqlite3DbMallocZero(db, sizeof(VectorIdxCursor));
@@ -216224,7 +216685,6 @@ typedef struct vectorVtab vectorVtab;
 struct vectorVtab {
   sqlite3_vtab base;       /* Base class - must be first */
   sqlite3 *db;             /* Database connection */
-  char* zDbSName;          /* Database schema name */
 };
 
 typedef struct vectorVtab_cursor vectorVtab_cursor;
@@ -216250,7 +216710,6 @@ static int vectorVtabConnect(
   sqlite3_vtab **ppVtab,
   char **pzErr
 ){
-  char *zDbSName = NULL;
   vectorVtab *pVtab = NULL;
   int rc;
   /*
@@ -216265,21 +216724,17 @@ static int vectorVtabConnect(
   if( pVtab == NULL ){
     return SQLITE_NOMEM_BKPT;
   }
-  zDbSName = sqlite3DbStrDup(db, argv[1]); // argv[1] is the database schema name by spec (see https://www.sqlite.org/vtab.html#the_xcreate_method)
-  if( zDbSName == NULL ){
-    sqlite3_free(pVtab);
-    return SQLITE_NOMEM_BKPT;
-  }
+  // > Eponymous virtual tables exist in the "main" schema only, so they will not work if prefixed with a different schema name.
+  // so, argv[1] always equal to "main" and we can safely ignore it
+  // (see https://www.sqlite.org/vtab.html#epovtab)
   memset(pVtab, 0, sizeof(*pVtab));
   pVtab->db = db;
-  pVtab->zDbSName = zDbSName;
   *ppVtab = (sqlite3_vtab*)pVtab;
   return SQLITE_OK;
 }
 
 static int vectorVtabDisconnect(sqlite3_vtab *pVtab){
   vectorVtab *pVTab = (vectorVtab*)pVtab;
-  sqlite3DbFree(pVTab->db, pVTab->zDbSName);
   sqlite3_free(pVtab);
   return SQLITE_OK;
 }
@@ -216346,7 +216801,7 @@ static int vectorVtabFilter(
   pCur->rows.aIntValues = NULL;
   pCur->rows.ppValues = NULL;
 
-  if( vectorIndexSearch(pVTab->db, pVTab->zDbSName, argc, argv, &pCur->rows, &pCur->nReads, &pCur->nWrites, &pVTab->base.zErrMsg) != 0 ){
+  if( vectorIndexSearch(pVTab->db, argc, argv, &pCur->rows, &pCur->nReads, &pCur->nWrites, &pVTab->base.zErrMsg) != 0 ){
     return SQLITE_ERROR;
   }
 

@@ -54,6 +54,10 @@ impl Conn for LibsqlConnection {
         })
     }
 
+    fn interrupt(&self) -> Result<()> {
+        self.conn.interrupt()
+    }
+
     fn is_autocommit(&self) -> bool {
         self.conn.is_autocommit()
     }
@@ -87,7 +91,7 @@ impl Drop for LibsqlConnection {
     }
 }
 
-pub(crate) struct LibsqlStmt(pub(super) crate::local::Statement);
+pub(crate) struct LibsqlStmt(pub crate::local::Statement);
 
 #[async_trait::async_trait]
 impl Stmt for LibsqlStmt {

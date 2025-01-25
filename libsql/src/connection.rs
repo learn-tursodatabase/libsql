@@ -21,6 +21,8 @@ pub(crate) trait Conn {
 
     async fn transaction(&self, tx_behavior: TransactionBehavior) -> Result<Transaction>;
 
+    fn interrupt(&self) -> Result<()>;
+
     fn is_autocommit(&self) -> bool;
 
     fn changes(&self) -> u64;
@@ -185,6 +187,11 @@ impl Connection {
         self.conn.transaction(tx_behavior).await
     }
 
+    /// Cancel ongoing operations and return at earliest opportunity.
+    pub fn interrupt(&self) -> Result<()> {
+        self.conn.interrupt()
+    }
+
     /// Check weather libsql is in `autocommit` or not.
     pub fn is_autocommit(&self) -> bool {
         self.conn.is_autocommit()
@@ -243,5 +250,11 @@ impl Connection {
         entry_point: Option<&str>,
     ) -> Result<()> {
         self.conn.load_extension(dylib_path.as_ref(), entry_point)
+    }
+}
+
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection").finish()
     }
 }

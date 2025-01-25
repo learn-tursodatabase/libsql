@@ -1,8 +1,12 @@
 // from tokio uring
 
-use std::mem::{size_of, MaybeUninit};
+use std::{
+    borrow::Borrow,
+    marker::PhantomData,
+    mem::{size_of, MaybeUninit},
+};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use zerocopy::{AsBytes, FromBytes};
 
 pub unsafe trait IoBuf: Unpin + 'static {
@@ -90,6 +94,20 @@ unsafe impl IoBuf for BytesMut {
     }
 }
 
+unsafe impl IoBuf for Bytes {
+    fn stable_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len()
+    }
+
+    fn bytes_total(&self) -> usize {
+        self.len()
+    }
+}
+
 unsafe impl IoBufMut for BytesMut {
     fn stable_mut_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()
@@ -134,6 +152,17 @@ impl<T> ZeroCopyBoxIoBuf<T> {
 
     pub fn new_uninit(inner: Box<T>) -> Self {
         Self { init: 0, inner }
+    }
+
+    /// same as new_uninit, but partially fills the buffer starting at offset
+    ///
+    /// # Safety: The caller must ensure that the remaining bytes are initialized
+    pub unsafe fn new_uninit_partial(inner: Box<T>, offset: usize) -> Self {
+        assert!(offset < size_of::<T>());
+        Self {
+            inner,
+            init: offset,
+        }
     }
 
     fn is_init(&self) -> bool {
@@ -185,11 +214,11 @@ impl<T> ZeroCopyBuf<T> {
         }
     }
 
-    pub fn map_slice<F>(self, f: F) -> MapSlice<T, F>
+    pub fn map_slice<F>(self, f: F) -> MapSlice<Self, F, T>
     where
         for<'a> F: Fn(&'a Self) -> &'a [u8] + Unpin + 'static,
     {
-        MapSlice { inner: self, f }
+        MapSlice::new(self, f)
     }
 
     #[inline]
@@ -220,32 +249,42 @@ impl<T> ZeroCopyBuf<T> {
     }
 }
 
-pub struct MapSlice<T, F> {
-    inner: ZeroCopyBuf<T>,
+pub struct MapSlice<T, F, U> {
+    inner: T,
     f: F,
+    _p: PhantomData<U>,
 }
 
-impl<T, F> MapSlice<T, F> {
-    pub(crate) fn into_inner(self) -> ZeroCopyBuf<T> {
+impl<T, F, U> MapSlice<T, F, U> {
+    pub(crate) fn into_inner(self) -> T {
         self.inner
+    }
+
+    pub(crate) fn new(inner: T, f: F) -> Self {
+        Self {
+            inner,
+            f,
+            _p: PhantomData,
+        }
     }
 }
 
-unsafe impl<T, F> IoBuf for MapSlice<T, F>
+unsafe impl<T, F, U> IoBuf for MapSlice<T, F, U>
 where
-    for<'a> F: Fn(&'a ZeroCopyBuf<T>) -> &'a [u8] + Unpin + 'static,
-    T: Unpin + 'static + AsBytes,
+    for<'a> F: Fn(&'a ZeroCopyBuf<U>) -> &'a [u8] + Unpin + 'static,
+    T: Borrow<ZeroCopyBuf<U>> + Unpin + 'static,
+    U: AsBytes + Unpin + 'static,
 {
     fn stable_ptr(&self) -> *const u8 {
-        (self.f)(&self.inner).as_ptr()
+        (self.f)(&self.inner.borrow()).as_ptr()
     }
 
     fn bytes_init(&self) -> usize {
-        (self.f)(&self.inner).len()
+        (self.f)(&self.inner.borrow()).len()
     }
 
     fn bytes_total(&self) -> usize {
-        (self.f)(&self.inner).len()
+        (self.f)(&self.inner.borrow()).len()
     }
 }
 

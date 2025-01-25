@@ -12,26 +12,29 @@ use aws_config::SdkConfig;
 use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::{ByteStream, SdkBody};
-use aws_sdk_s3::types::{CreateBucketConfiguration, Object};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, CompletedPart, CreateBucketConfiguration, Object,
+};
 use aws_sdk_s3::Client;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use http_body::{Frame as HttpFrame, SizeHint};
+use futures::future::poll_fn;
+use futures::{StreamExt, TryFutureExt as _, TryStreamExt};
+use http_body::{Body, Frame as HttpFrame, SizeHint};
 use libsql_sys::name::NamespaceName;
-use roaring::RoaringBitmap;
+use pin_project_lite::pin_project;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio_stream::Stream;
+use tokio_util::codec::Decoder;
 use tokio_util::sync::ReusableBoxFuture;
 use zerocopy::byteorder::little_endian::{U16 as lu16, U32 as lu32, U64 as lu64};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use super::{Backend, FindSegmentReq, SegmentMeta};
-use crate::io::buf::ZeroCopyBuf;
 use crate::io::compat::copy_to_file;
 use crate::io::{FileExt, Io, StdIO};
-use crate::segment::compacted::CompactedSegmentDataHeader;
-use crate::segment::Frame;
-use crate::storage::{Error, RestoreOptions, Result, SegmentInfo, SegmentKey};
+use crate::segment::compacted::{CompactedFrame, CompactedFrameHeader, CompactedSegmentHeader};
+use crate::storage::{Error, Result, SegmentInfo, SegmentKey};
 use crate::LIBSQL_MAGIC;
 
 pub struct S3Backend<IO> {
@@ -39,6 +42,7 @@ pub struct S3Backend<IO> {
     default_config: Arc<S3Config>,
     io: IO,
 }
+
 impl S3Backend<StdIO> {
     pub async fn from_sdk_config(
         aws_config: SdkConfig,
@@ -137,17 +141,121 @@ impl<IO: Io> S3Backend<IO> {
         folder_key: &FolderKey<'_>,
         segment_key: &SegmentKey,
         file: &impl FileExt,
-    ) -> Result<CompactedSegmentDataHeader> {
+    ) -> Result<CompactedSegmentHeader> {
         let reader = self
             .fetch_segment_data_reader(config, folder_key, segment_key)
             .await?;
         let mut reader = tokio::io::BufReader::with_capacity(8196, reader);
-        while reader.fill_buf().await?.len() < size_of::<CompactedSegmentDataHeader>() {}
-        let header = CompactedSegmentDataHeader::read_from_prefix(reader.buffer()).unwrap();
+        while reader.fill_buf().await?.len() < size_of::<CompactedSegmentHeader>() {}
+        let header = CompactedSegmentHeader::read_from_prefix(reader.buffer()).unwrap();
 
         copy_to_file(reader, file).await?;
 
         Ok(header)
+    }
+
+    /// returns a stream over raw CompactedFrame bytes
+    async fn fetch_segment_data_stream_inner(
+        &self,
+        config: &S3Config,
+        folder_key: &FolderKey<'_>,
+        segment_key: &SegmentKey,
+    ) -> Result<(
+        CompactedSegmentHeader,
+        impl Stream<Item = Result<(CompactedFrameHeader, Bytes)>>,
+    )> {
+        let reader = self
+            .fetch_segment_data_reader(config, folder_key, segment_key)
+            .await?;
+
+        let mut reader = BufReader::new(reader);
+        let mut header = CompactedSegmentHeader::new_zeroed();
+        reader.read_exact(header.as_bytes_mut()).await?;
+
+        struct FrameDecoder {
+            verify: bool,
+            finished: bool,
+            current_crc: u32,
+        }
+
+        impl FrameDecoder {
+            fn new(verify: bool, header: &CompactedSegmentHeader) -> Self {
+                let current_crc = if verify {
+                    crc32fast::hash(header.as_bytes())
+                } else {
+                    0
+                };
+
+                Self {
+                    finished: false,
+                    verify,
+                    current_crc,
+                }
+            }
+        }
+
+        impl Decoder for FrameDecoder {
+            type Item = (CompactedFrameHeader, Bytes);
+            type Error = Error;
+
+            fn decode(
+                &mut self,
+                src: &mut BytesMut,
+            ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+                if self.finished {
+                    return Ok(None);
+                }
+
+                if src.len() >= size_of::<CompactedFrame>() {
+                    let mut data = src.split_to(size_of::<CompactedFrame>());
+                    let header_bytes = data.split_to(size_of::<CompactedFrameHeader>());
+                    let header = CompactedFrameHeader::read_from(&header_bytes).unwrap();
+
+                    if header.is_last() {
+                        self.finished = true;
+                    }
+
+                    if self.verify {
+                        let checksum = header.compute_checksum(self.current_crc, &data);
+                        if checksum != header.checksum() {
+                            todo!("invalid frame checksum")
+                        }
+                        self.current_crc = checksum;
+                    }
+
+                    return Ok(Some((header, data.freeze())));
+                } else {
+                    if src.capacity() < size_of::<CompactedFrame>() {
+                        src.reserve(size_of::<CompactedFrame>() - src.capacity())
+                    }
+                    Ok(None)
+                }
+            }
+
+            fn decode_eof(
+                &mut self,
+                buf: &mut BytesMut,
+            ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+                match self.decode(buf)? {
+                    Some(frame) => Ok(Some(frame)),
+                    None => {
+                        if buf.is_empty() {
+                            Ok(None)
+                        } else {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "bytes remaining on stream",
+                            )
+                            .into())
+                        }
+                    }
+                }
+            }
+        }
+
+        let stream = tokio_util::codec::FramedRead::new(reader, FrameDecoder::new(true, &header));
+
+        Ok((header, stream))
     }
 
     async fn s3_get(&self, config: &S3Config, key: impl ToString) -> Result<GetObjectOutput> {
@@ -171,6 +279,123 @@ impl<IO: Io> S3Backend<IO> {
             .await
             .map_err(|e| Error::unhandled(e, "error sending s3 PUT request"))?;
         Ok(())
+    }
+
+    #[tracing::instrument(skip_all, fields(key))]
+    async fn s3_put_multipart<B>(
+        &self,
+        config: &S3Config,
+        key: impl ToString,
+        data: B,
+    ) -> Result<()>
+    where
+        B: Body<Data = Bytes, Error = crate::storage::Error>,
+    {
+        const MAX_CHUNK_SIZE: u64 = 50 * 1024 * 1024; // 50MB
+        let (s_chunks, r_chunks) = tokio::sync::mpsc::channel(8);
+        let key = key.to_string();
+
+        let upload = self
+            .client
+            .create_multipart_upload()
+            .bucket(&config.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| Error::unhandled(e, "creating multipart upload"))?;
+        let upload_id = upload.upload_id();
+
+        let make_chunk_fut = async {
+            let mut current_chunk_file = self.io.tempfile()?;
+            let mut current_chunk_len = 0;
+            tokio::pin!(data);
+            loop {
+                let next_frame_fut = poll_fn(|cx| data.as_mut().poll_frame(cx));
+                let Some(frame) = next_frame_fut.await else {
+                    let _ = s_chunks.send(current_chunk_file).await;
+                    break;
+                };
+                let frame = frame?;
+                assert!(frame.is_data());
+                let data = frame.into_data().unwrap();
+                let offset = current_chunk_len;
+                current_chunk_len += data.len() as u64;
+                let (_, ret) = current_chunk_file.write_all_at_async(data, offset).await;
+                ret?;
+                if current_chunk_len >= MAX_CHUNK_SIZE {
+                    let new_chunk_file = self.io.tempfile()?;
+                    current_chunk_len = 0;
+                    let old_chunk_file = std::mem::replace(&mut current_chunk_file, new_chunk_file);
+                    if s_chunks.send(old_chunk_file).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            // make sure we move the sender in the future so the chunk sender eventually exits.
+            drop(s_chunks);
+
+            Ok(())
+        };
+
+        let send_chunks_fut = async {
+            let builder = tokio_stream::wrappers::ReceiverStream::new(r_chunks)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let i = i;
+                    self.client
+                        .upload_part()
+                        .bucket(&config.bucket)
+                        .key(&key)
+                        .part_number(i as i32 + 1) // part number must be between 1-10000
+                        .set_upload_id(upload_id.map(ToString::to_string))
+                        .body(FileStreamBody::new(chunk).into_byte_stream())
+                        .send()
+                        .map_err(|e| Error::unhandled(e, format!("sending chunk")))
+                        .map_ok(move |resp| {
+                            CompletedPart::builder()
+                                .set_e_tag(resp.e_tag)
+                                .set_part_number(Some(i as i32 + 1))
+                                .build()
+                        })
+                })
+                .buffered(8)
+                .try_fold(CompletedMultipartUpload::builder(), |builder, completed| {
+                    std::future::ready(Ok(builder.parts(completed)))
+                })
+                .await?;
+
+            Ok(builder.build())
+        };
+
+        let ret = tokio::try_join!(send_chunks_fut, make_chunk_fut);
+
+        match ret {
+            Ok((parts, _)) => {
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&config.bucket)
+                    .set_upload_id(upload_id.map(ToString::to_string))
+                    .multipart_upload(parts)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| Error::unhandled(e, format!("completing multipart upload")))?;
+
+                Ok(())
+            }
+            Err(e) => {
+                self.client
+                    .abort_multipart_upload()
+                    .bucket(&config.bucket)
+                    .set_upload_id(upload_id.map(ToString::to_string))
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| Error::unhandled(e, format!("aborting multipart upload")))?;
+                Err(e)
+            }
+        }
     }
 
     async fn fetch_segment_index_inner(
@@ -327,71 +552,6 @@ impl<IO: Io> S3Backend<IO> {
         }
     }
 
-    // This method could probably be optimized a lot by using indexes and only downloading useful
-    // segments
-    async fn restore_latest(
-        &self,
-        config: &S3Config,
-        namespace: &NamespaceName,
-        dest: impl FileExt,
-    ) -> Result<()> {
-        let folder_key = FolderKey {
-            cluster_id: &config.cluster_id,
-            namespace,
-        };
-        let Some(latest_key) = self
-            .find_segment_by_frame_no(config, &folder_key, u64::MAX)
-            .await?
-        else {
-            tracing::info!("nothing to restore for {namespace}");
-            return Ok(());
-        };
-
-        let reader = self
-            .fetch_segment_data_reader(config, &folder_key, &latest_key)
-            .await?;
-        let mut reader = BufReader::new(reader);
-        let mut header: CompactedSegmentDataHeader = CompactedSegmentDataHeader::new_zeroed();
-        reader.read_exact(header.as_bytes_mut()).await?;
-        let db_size = header.size_after.get();
-        let mut seen = RoaringBitmap::new();
-        let mut frame: Frame = Frame::new_zeroed();
-        loop {
-            for _ in 0..header.frame_count.get() {
-                reader.read_exact(frame.as_bytes_mut()).await?;
-                let page_no = frame.header().page_no();
-                if !seen.contains(page_no) {
-                    seen.insert(page_no);
-                    let offset = (page_no as u64 - 1) * 4096;
-                    let buf = ZeroCopyBuf::new_init(frame).map_slice(|f| f.get_ref().data());
-                    let (buf, ret) = dest.write_all_at_async(buf, offset).await;
-                    ret?;
-                    frame = buf.into_inner().into_inner();
-                }
-            }
-
-            // db is restored
-            if seen.len() == db_size as u64 {
-                break;
-            }
-
-            let next_frame_no = header.start_frame_no.get() - 1;
-            let Some(key) = self
-                .find_segment_by_frame_no(config, &folder_key, next_frame_no)
-                .await?
-            else {
-                todo!("there should be a segment!");
-            };
-            let r = self
-                .fetch_segment_data_reader(config, &folder_key, &key)
-                .await?;
-            reader = BufReader::new(r);
-            reader.read_exact(header.as_bytes_mut()).await?;
-        }
-
-        Ok(())
-    }
-
     async fn fetch_segment_from_key(
         &self,
         config: &S3Config,
@@ -450,6 +610,57 @@ impl<IO: Io> S3Backend<IO> {
                 }
             }
         }
+    }
+
+    async fn store_segment_data_inner<B>(
+        &self,
+        config: &S3Config,
+        namespace: &NamespaceName,
+        body: B,
+        segment_key: &SegmentKey,
+    ) -> Result<()>
+    where
+        B: Body<Data = Bytes, Error = crate::storage::Error>,
+    {
+        let folder_key = FolderKey {
+            cluster_id: &config.cluster_id,
+            namespace,
+        };
+        let s3_data_key = s3_segment_data_key(&folder_key, segment_key);
+
+        self.s3_put_multipart(config, s3_data_key, body).await
+    }
+
+    async fn store_segment_index_inner(
+        &self,
+        config: &S3Config,
+        namespace: &NamespaceName,
+        index: Vec<u8>,
+        segment_key: &SegmentKey,
+    ) -> Result<()> {
+        let folder_key = FolderKey {
+            cluster_id: &config.cluster_id,
+            namespace,
+        };
+        let s3_index_key = s3_segment_index_key(&folder_key, segment_key);
+
+        let checksum = crc32fast::hash(&index);
+        let header = SegmentIndexHeader {
+            version: 1.into(),
+            len: (index.len() as u64).into(),
+            checksum: checksum.into(),
+            magic: LIBSQL_MAGIC.into(),
+        };
+
+        let mut bytes = BytesMut::with_capacity(size_of::<SegmentIndexHeader>() + index.len());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&index);
+
+        let body = ByteStream::from(bytes.freeze());
+
+        self.s3_put(config, s3_index_key, body).await?;
+
+        Ok(())
     }
 }
 
@@ -547,36 +758,12 @@ where
         segment_data: impl FileExt,
         segment_index: Vec<u8>,
     ) -> Result<()> {
-        let folder_key = FolderKey {
-            cluster_id: &config.cluster_id,
-            namespace: &meta.namespace,
-        };
         let segment_key = SegmentKey::from(&meta);
-        let s3_data_key = s3_segment_data_key(&folder_key, &segment_key);
-
-        let body = FileStreamBody::new(segment_data).into_byte_stream();
-
-        self.s3_put(config, s3_data_key, body).await?;
-
-        let s3_index_key = s3_segment_index_key(&folder_key, &segment_key);
-
-        let checksum = crc32fast::hash(&segment_index);
-        let header = SegmentIndexHeader {
-            version: 1.into(),
-            len: (segment_index.len() as u64).into(),
-            checksum: checksum.into(),
-            magic: LIBSQL_MAGIC.into(),
-        };
-
-        let mut bytes =
-            BytesMut::with_capacity(size_of::<SegmentIndexHeader>() + segment_index.len());
-        bytes.extend_from_slice(header.as_bytes());
-        bytes.extend_from_slice(&segment_index);
-
-        let body = ByteStream::from(bytes.freeze());
-
-        self.s3_put(config, s3_index_key, body).await?;
-
+        let body = FileStreamBody::new(segment_data);
+        self.store_segment_data_inner(config, &meta.namespace, body, &segment_key)
+            .await?;
+        self.store_segment_index(config, &meta.namespace, &segment_key, segment_index)
+            .await?;
         Ok(())
     }
 
@@ -602,19 +789,6 @@ where
 
     fn default_config(&self) -> Self::Config {
         self.default_config.clone()
-    }
-
-    async fn restore(
-        &self,
-        config: &Self::Config,
-        namespace: &NamespaceName,
-        restore_options: RestoreOptions,
-        dest: impl FileExt,
-    ) -> Result<()> {
-        match restore_options {
-            RestoreOptions::Latest => self.restore_latest(config, &namespace, dest).await,
-            RestoreOptions::Timestamp(_) => todo!(),
-        }
     }
 
     async fn find_segment(
@@ -660,7 +834,7 @@ where
         namespace: &NamespaceName,
         key: &SegmentKey,
         file: &impl FileExt,
-    ) -> Result<CompactedSegmentDataHeader> {
+    ) -> Result<CompactedSegmentHeader> {
         let folder_key = FolderKey {
             cluster_id: &config.cluster_id,
             namespace: &namespace,
@@ -690,6 +864,83 @@ where
         until: u64,
     ) -> impl Stream<Item = Result<SegmentInfo>> + 'a {
         self.list_segments_inner(config, namespace, until)
+    }
+
+    async fn fetch_segment_data_stream(
+        &self,
+        config: Self::Config,
+        namespace: &NamespaceName,
+        key: SegmentKey,
+    ) -> Result<(
+        CompactedSegmentHeader,
+        impl Stream<Item = Result<(CompactedFrameHeader, Bytes)>>,
+    )> {
+        let folder_key = FolderKey {
+            cluster_id: &config.cluster_id,
+            namespace: &namespace,
+        };
+        self.fetch_segment_data_stream_inner(&config, &folder_key, &key)
+            .await
+    }
+
+    async fn store_segment_data(
+        &self,
+        config: &Self::Config,
+        namespace: &NamespaceName,
+        segment_key: &SegmentKey,
+        segment_data: impl Stream<Item = Result<Bytes>> + Send + 'static,
+    ) -> Result<()> {
+        let byte_stream = StreamBody::new(segment_data);
+        self.store_segment_data_inner(config, namespace, byte_stream, &segment_key)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn store_segment_index(
+        &self,
+        config: &Self::Config,
+        namespace: &NamespaceName,
+        segment_key: &SegmentKey,
+        index: Vec<u8>,
+    ) -> Result<()> {
+        self.store_segment_index_inner(config, namespace, index, segment_key)
+            .await?;
+
+        Ok(())
+    }
+}
+
+pin_project! {
+    struct StreamBody<S> {
+        #[pin]
+        s: S,
+    }
+}
+
+impl<S> StreamBody<S> {
+    fn new(s: S) -> Self {
+        Self { s }
+    }
+}
+
+impl<S> http_body::Body for StreamBody<S>
+where
+    S: Stream<Item = Result<Bytes>>,
+{
+    type Data = bytes::Bytes;
+    type Error = crate::storage::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<std::result::Result<HttpFrame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        match std::task::ready!(this.s.poll_next(cx)) {
+            Some(Ok(data)) => Poll::Ready(Some(Ok(HttpFrame::data(data)))),
+            Some(Err(e)) => Poll::Ready(Some(Err(e))),
+            None => Poll::Ready(None),
+        }
     }
 }
 
@@ -741,7 +992,7 @@ where
     F: FileExt,
 {
     type Data = Bytes;
-    type Error = std::io::Error;
+    type Error = crate::storage::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -775,7 +1026,7 @@ where
                     }
                     Poll::Ready(Err(e)) => {
                         self.state = StreamState::Done;
-                        return Poll::Ready(Some(Err(e)));
+                        return Poll::Ready(Some(Err(e.into())));
                     }
                     Poll::Pending => return Poll::Pending,
                 },
@@ -802,7 +1053,6 @@ mod tests {
     use fst::MapBuilder;
     use s3s::auth::SimpleAuth;
     use s3s::service::{S3ServiceBuilder, SharedS3Service};
-    use uuid::Uuid;
 
     use crate::io::StdIO;
 
@@ -870,7 +1120,6 @@ mod tests {
                 &s3_config,
                 SegmentMeta {
                     namespace: ns.clone(),
-                    segment_id: Uuid::new_v4(),
                     start_frame_no: 1u64.into(),
                     end_frame_no: 64u64.into(),
                     segment_timestamp: Utc::now(),
@@ -892,7 +1141,6 @@ mod tests {
                 &s3_config,
                 SegmentMeta {
                     namespace: ns.clone(),
-                    segment_id: Uuid::new_v4(),
                     start_frame_no: 64u64.into(),
                     end_frame_no: 128u64.into(),
                     segment_timestamp: Utc::now(),
